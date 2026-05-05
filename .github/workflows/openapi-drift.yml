@@ -1,0 +1,79 @@
+# openapi-drift — fails when any auto-generated artefact is out of date.
+#
+# Three layers, all derived from the same source-of-truth (swag annotations on
+# the handlers):
+#
+#   1. internal/api/docs/{swagger.json,swagger.yaml,docs.go}  ← swag init
+#   2. docs/assets/api-{dark,light}.svg                        ← cmd/genapicard
+#   3. docs/api.md (regions inside <!-- gendocs:* --> markers) ← cmd/gendocs
+#
+# Without this check, a change to a handler annotation without a `make docs`
+# leaves the spec, the SVG cards, or the markdown reference stale.  Strategy:
+# run the same `make docs` target the developer would, then `git diff
+# --exit-code` the directories that hold the generated content.
+#
+# Note: docs/api.md is fully managed by gendocs (markers + injected content),
+# but the *template* content outside the markers is also part of the diff
+# surface.  Editing prose between the markers is fine; editing inside them
+# will be reverted on the next `make docs`.
+
+name: OpenAPI spec drift
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - cmd/**
+      - internal/api/**
+      - docs/api.md
+      - docs/assets/api-*.svg
+      - go.mod
+      - go.sum
+      - Makefile
+      - .github/workflows/openapi-drift.yml
+  pull_request:
+    branches: [main]
+    paths:
+      - cmd/**
+      - internal/api/**
+      - docs/api.md
+      - docs/assets/api-*.svg
+      - go.mod
+      - go.sum
+      - Makefile
+      - .github/workflows/openapi-drift.yml
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  drift:
+    name: spec, SVG cards, and api.md are up to date
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Regenerate spec, SVG cards, and api.md
+        run: make docs
+
+      - name: Verify all generated artefacts match what's committed
+        run: |
+          if ! git diff --exit-code -- internal/api/docs docs/api.md docs/assets/api-dark.svg docs/assets/api-light.svg; then
+            echo ""
+            echo "✗ Generated documentation is out of date."
+            echo "  Run 'make docs' locally and commit the result."
+            exit 1
+          fi
+          echo "✔  All generated artefacts are in sync with handler annotations."
