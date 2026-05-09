@@ -58,8 +58,25 @@ func envOrDefault(key, def string) string {
 //	E2E_KEYCLOAK_NAMESPACE      namespace where Keycloak runs (default: keycloak)
 //	E2E_KEYCLOAK_SERVICE        Keycloak Service name (default: keycloak-keycloakx-http)
 //	E2E_KEYCLOAK_REALM          Keycloak realm (default: nebari)
-//	E2E_KEYCLOAK_ADMIN_USER     realm admin username (default: admin)
+//	E2E_KEYCLOAK_ADMIN_USER     realm admin username — must be in the "admin" group (default: admin)
 //	E2E_KEYCLOAK_ADMIN_PASSWORD realm admin password (default: nebari-realm-admin)
+//	E2E_TEST_USER               unprivileged test-user for regular-user flows (default: test-user)
+//	E2E_TEST_USER_PASSWORD      password for E2E_TEST_USER (default: test-user)
+//	E2E_OIDC_CLIENT_ID          OIDC client ID for token acquisition (default: nebari-system-nebari-landing)
+//	E2E_OIDC_CLIENT_SECRET      OIDC client secret written by the operator to nebari-landing-oidc-client
+//
+// Token acquisition uses the operator-provisioned confidential client
+// (nebari-system-nebari-landing) rather than admin-cli.  Keycloak 26+ sets
+// client.use.lightweight.access.token.enabled=true on admin-cli by default,
+// stripping all identity claims (sub, preferred_username) from its access
+// tokens — which causes 401s on identity-keyed endpoints like /api/v1/pins.
+// The confidential client carries no such flag and issues full-claims tokens.
+//
+// directAccessGrantsEnabled is patched on by the e2e CI workflow (not set by
+// the operator, which correctly leaves it false in production).
+// TODO: remove the CI kcadm patch once nebari-operator supports
+//   spec.auth.keycloakConfig.directAccessGrantsEnabled.
+//   Tracking: https://github.com/nebari-dev/nebari-operator/issues/TBD
 var (
 	e2eNamespace = envOrDefault("E2E_NAMESPACE", "nebari-system")
 
@@ -89,8 +106,22 @@ var (
 	// not the HTTP default 80.  Override to 80 only for older local deployments.
 	kcPort          = envOrDefault("E2E_KEYCLOAK_PORT", "8080")
 	kcRealm         = envOrDefault("E2E_KEYCLOAK_REALM", "nebari")
+	// kcAdminUser is the realm admin — must be in the "admin" Keycloak group.
+	// Used only for tests that exercise admin-gated endpoints.
 	kcAdminUser     = envOrDefault("E2E_KEYCLOAK_ADMIN_USER", "admin")
 	kcAdminPassword = envOrDefault("E2E_KEYCLOAK_ADMIN_PASSWORD", "nebari-realm-admin")
+	// kcTestUser is an unprivileged user for regular-user flows (pins, access
+	// requests from the requester side, notification reads, etc.).
+	kcTestUser     = envOrDefault("E2E_TEST_USER", "test-user")
+	kcTestPassword = envOrDefault("E2E_TEST_USER_PASSWORD", "test-user")
+
+	// oidcClientID / oidcClientSecret are used for password-grant token
+	// acquisition in the e2e tests.  We use the operator-provisioned confidential
+	// client rather than admin-cli because Keycloak 26+ enables
+	// client.use.lightweight.access.token.enabled on admin-cli by default,
+	// which strips sub and preferred_username from access tokens.
+	oidcClientID     = envOrDefault("E2E_OIDC_CLIENT_ID", "nebari-system-nebari-landing")
+	oidcClientSecret = os.Getenv("E2E_OIDC_CLIENT_SECRET")
 )
 
 // VeryLongTimeout is used for slow cluster operations.
@@ -183,6 +214,42 @@ func startPortForwardAndWait(namespace, target, ports string) *exec.Cmd {
 	return cmd
 }
 
+// acquireToken obtains an access token from Keycloak via the resource-owner
+// password grant using the operator-provisioned confidential client.
+//
+// The Keycloak port-forward to localhost:18090 must already be running when
+// this is called (the parent BeforeAll starts it via startPortForwardAndWait).
+// The Host header is set to the in-cluster service name so the token issuer
+// matches KEYCLOAK_ISSUER_URL that the webapi was patched with.
+func acquireToken(username, password string) string {
+	GinkgoHelper()
+	tokenForm := url.Values{
+		"client_id":     {oidcClientID},
+		"client_secret": {oidcClientSecret},
+		"username":      {username},
+		"password":      {password},
+		"grant_type":    {"password"},
+		"scope":         {"openid profile"},
+	}
+	tokenReq, err := http.NewRequest(http.MethodPost,
+		fmt.Sprintf("http://localhost:18090/realms/%s/protocol/openid-connect/token", kcRealm),
+		strings.NewReader(tokenForm.Encode()))
+	Expect(err).NotTo(HaveOccurred())
+	tokenReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	tokenReq.Host = fmt.Sprintf("%s.%s.svc.cluster.local", kcService, kcNamespace)
+	tokenResp, err := http.DefaultClient.Do(tokenReq)
+	Expect(err).NotTo(HaveOccurred())
+	defer tokenResp.Body.Close()
+	Expect(tokenResp.StatusCode).To(Equal(http.StatusOK),
+		fmt.Sprintf("Keycloak token request must succeed (realm=%s, user=%s)", kcRealm, username))
+	var td struct {
+		AccessToken string `json:"access_token"`
+	}
+	Expect(json.NewDecoder(tokenResp.Body).Decode(&td)).To(Succeed())
+	Expect(td.AccessToken).NotTo(BeEmpty())
+	return td.AccessToken
+}
+
 // newNebariApp creates an unstructured NebariApp with a landing-page config.
 // No api/v1 import is needed — the resource is built from raw field maps.
 //
@@ -224,6 +291,38 @@ func newNebariApp(name, namespace, hostname, visibility string, priority int) *u
 	return u
 }
 
+// newTestService creates a minimal Kubernetes Service for testing NebariApp discovery.
+// The NebariApp CRDs created by tests point to spec.service.name="test-service",
+// so we need an actual K8s Service to exist for the webapi watcher to report them.
+func newTestService(name, namespace string, port int) *unstructured.Unstructured {
+	u := &unstructured.Unstructured{}
+	u.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "",
+		Version: "v1",
+		Kind:    "Service",
+	})
+	u.SetName(name)
+	u.SetNamespace(namespace)
+
+	spec := map[string]interface{}{
+		"type": "ClusterIP",
+		"ports": []interface{}{
+			map[string]interface{}{
+				"name":       "http",
+				"port":       int64(port),
+				"targetPort": int64(port),
+				"protocol":   "TCP",
+			},
+		},
+		"selector": map[string]interface{}{
+			"app": "test-dummy",
+		},
+	}
+
+	_ = unstructured.SetNestedMap(u.Object, spec, "spec")
+	return u
+}
+
 var _ = Describe("Webapi – Service Discovery", Ordered, func() {
 	var (
 		ctx           = context.Background()
@@ -242,6 +341,11 @@ var _ = Describe("Webapi – Service Discovery", Ordered, func() {
 		applyNs.Stdin = strings.NewReader(nsYAML)
 		_, err = utils.Run(applyNs)
 		Expect(err).NotTo(HaveOccurred(), "Failed to apply namespace %s", namespace)
+
+		By("Creating shared backing Service for all test NebariApps")
+		sharedTestSvc := newTestService("test-service", e2eNamespace, 8080)
+		Expect(k8sClient.Create(ctx, sharedTestSvc)).To(Succeed(), "should create shared test-service")
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, sharedTestSvc) })
 
 		By("Starting Keycloak port-forward to discover issuer URL")
 		keycloakPFCmd = startPortForwardAndWait(kcNamespace, fmt.Sprintf("svc/%s", kcService), fmt.Sprintf("18090:%s", kcPort))
@@ -321,7 +425,10 @@ var _ = Describe("Webapi – Service Discovery", Ordered, func() {
 
 	AfterAll(func() {
 		By("Deleting test NebariApp resources")
-		for _, name := range []string{testAppName, "test-auth-visibility"} {
+		// Sub-context NebariApps (test-pin-app, test-ar-app) also live under the
+		// outer Describe — strip finalizers here too so a partial run leaves no
+		// Terminating-but-stuck CRs behind for the next run to trip on.
+		for _, name := range []string{testAppName, "test-auth-visibility", "test-pin-app", "test-ar-app"} {
 			u := &unstructured.Unstructured{}
 			u.SetGroupVersionKind(nebariAppGVK)
 			u.SetName(name)
@@ -390,32 +497,8 @@ var _ = Describe("Webapi – Service Discovery", Ordered, func() {
 
 		It("should filter services based on visibility", func() {
 			By("Acquiring a JWT from Keycloak (host-header override for issuer match)")
-			// The port-forward reaches Keycloak at localhost:18090, but the Host header
-			// must match the in-cluster hostname so the token issuer ("iss") equals
-			// KEYCLOAK_URL/realms/<realm>, which is what the webapi validates.
-			tokenForm := url.Values{
-				"client_id":  {"admin-cli"},
-				"username":   {kcAdminUser},
-				"password":   {kcAdminPassword},
-				"grant_type": {"password"},
-				"scope":      {"openid profile"},
-			}
-			tokenReq, err := http.NewRequest(http.MethodPost,
-				fmt.Sprintf("http://localhost:18090/realms/%s/protocol/openid-connect/token", kcRealm),
-				strings.NewReader(tokenForm.Encode()))
-			Expect(err).NotTo(HaveOccurred())
-			tokenReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-			tokenReq.Host = fmt.Sprintf("%s.%s.svc.cluster.local", kcService, kcNamespace)
-			tokenResp, err := http.DefaultClient.Do(tokenReq)
-			Expect(err).NotTo(HaveOccurred(), "Should be able to request token from Keycloak")
-			defer tokenResp.Body.Close()
-			Expect(tokenResp.StatusCode).To(Equal(http.StatusOK),
-				fmt.Sprintf("Keycloak token request must succeed (realm=%s, user=%s)", kcRealm, kcAdminUser))
-			var tokenData struct {
-				AccessToken string `json:"access_token"`
-			}
-			Expect(json.NewDecoder(tokenResp.Body).Decode(&tokenData)).To(Succeed())
-			Expect(tokenData.AccessToken).NotTo(BeEmpty(), "JWT must be non-empty")
+			tokenData := struct{ AccessToken string }{}
+			tokenData.AccessToken = acquireToken(kcTestUser, kcTestPassword)
 
 			By("Creating a NebariApp with authenticated visibility")
 			authApp := newNebariApp("test-auth-visibility", namespace,
@@ -557,6 +640,507 @@ var _ = Describe("Webapi – Service Discovery", Ordered, func() {
 			Expect(err).NotTo(HaveOccurred())
 			defer resp.Body.Close()
 			Expect(resp.StatusCode).To(Equal(http.StatusMethodNotAllowed))
+		})
+	})
+
+	// Pins — e2e coverage for GET/PUT/DELETE /api/v1/pins against a live cluster.
+	Context("Pins", func() {
+		var (
+			webapiBase  string
+			pfCmd       *exec.Cmd
+			bearerToken string
+			serviceUID  string
+			pinAppName  = "test-pin-app"
+		)
+
+		BeforeAll(func() {
+			By("Acquiring a JWT from Keycloak (test-user — unprivileged)")
+			bearerToken = acquireToken(kcTestUser, kcTestPassword)
+
+			By("Creating a public NebariApp for pinning")
+			pinApp := newNebariApp(pinAppName, e2eNamespace,
+				fmt.Sprintf("%s.nebari.test", pinAppName), "public", 88)
+			Expect(k8sClient.Create(context.Background(), pinApp)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(context.Background(), pinApp) })
+
+			By("Port-forwarding to webapi on :18084")
+			pfCmd = exec.Command("kubectl", "port-forward",
+				"-n", e2eNamespace, fmt.Sprintf("svc/%s", e2eWebapiService), "18084:8080")
+			Expect(pfCmd.Start()).NotTo(HaveOccurred())
+			webapiBase = "http://localhost:18084"
+
+			Eventually(func() error {
+				resp, err := http.Get(webapiBase + "/api/v1/health")
+				if err != nil {
+					return err
+				}
+				resp.Body.Close()
+				return nil
+			}, 30*time.Second, time.Second).Should(Succeed())
+
+			By("Waiting for watcher to process the NebariApp and extracting service UID")
+			Eventually(func() error {
+				req, err := http.NewRequest(http.MethodGet, webapiBase+"/api/v1/services", nil)
+				if err != nil {
+					return err
+				}
+				req.Header.Set("Authorization", "Bearer "+bearerToken)
+				resp, err := http.DefaultClient.Do(req)
+				if err != nil {
+					return err
+				}
+				defer resp.Body.Close()
+				var result ServiceListResponse
+				if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+					return err
+				}
+				for _, svc := range result.Services {
+					if name, _ := svc["name"].(string); name == "Test Service "+pinAppName {
+						if uid, _ := svc["id"].(string); uid != "" {
+							serviceUID = uid
+							return nil
+						}
+					}
+				}
+				return fmt.Errorf("service %q not yet visible", pinAppName)
+			}, VeryLongTimeout, 2*time.Second).Should(Succeed(),
+				"NebariApp should appear in services list")
+		})
+
+		AfterAll(func() {
+			if pfCmd != nil && pfCmd.Process != nil {
+				_ = pfCmd.Process.Kill()
+			}
+		})
+
+		It("should return an empty pin list for a new user", func() {
+			req, err := http.NewRequest(http.MethodGet, webapiBase+"/api/v1/pins", nil)
+			Expect(err).NotTo(HaveOccurred())
+			req.Header.Set("Authorization", "Bearer "+bearerToken)
+			resp, err := http.DefaultClient.Do(req)
+			Expect(err).NotTo(HaveOccurred())
+			defer resp.Body.Close()
+			Expect(resp.StatusCode).To(Equal(http.StatusOK))
+			var body struct {
+				Pins []interface{} `json:"pins"`
+			}
+			Expect(json.NewDecoder(resp.Body).Decode(&body)).To(Succeed())
+			Expect(body.Pins).To(BeEmpty(), "new user should have no pins")
+		})
+
+		It("should pin a service", func() {
+			req, err := http.NewRequest(http.MethodPut,
+				webapiBase+"/api/v1/pins/"+serviceUID, nil)
+			Expect(err).NotTo(HaveOccurred())
+			req.Header.Set("Authorization", "Bearer "+bearerToken)
+			resp, err := http.DefaultClient.Do(req)
+			Expect(err).NotTo(HaveOccurred())
+			defer resp.Body.Close()
+			Expect(resp.StatusCode).To(Equal(http.StatusNoContent),
+				"PUT /api/v1/pins/{uid} must return 204")
+		})
+
+		It("should return the pinned service in GET /api/v1/pins", func() {
+			req, err := http.NewRequest(http.MethodGet, webapiBase+"/api/v1/pins", nil)
+			Expect(err).NotTo(HaveOccurred())
+			req.Header.Set("Authorization", "Bearer "+bearerToken)
+			resp, err := http.DefaultClient.Do(req)
+			Expect(err).NotTo(HaveOccurred())
+			defer resp.Body.Close()
+			Expect(resp.StatusCode).To(Equal(http.StatusOK))
+			var body struct {
+				Pins []map[string]interface{} `json:"pins"`
+			}
+			Expect(json.NewDecoder(resp.Body).Decode(&body)).To(Succeed())
+			Expect(body.Pins).To(HaveLen(1), "one service should be pinned")
+			Expect(body.Pins[0]["uid"]).To(Equal(serviceUID))
+		})
+
+		It("should unpin a service", func() {
+			req, err := http.NewRequest(http.MethodDelete,
+				webapiBase+"/api/v1/pins/"+serviceUID, nil)
+			Expect(err).NotTo(HaveOccurred())
+			req.Header.Set("Authorization", "Bearer "+bearerToken)
+			resp, err := http.DefaultClient.Do(req)
+			Expect(err).NotTo(HaveOccurred())
+			defer resp.Body.Close()
+			Expect(resp.StatusCode).To(Equal(http.StatusNoContent),
+				"DELETE /api/v1/pins/{uid} must return 204")
+
+			By("Verifying the pin list is empty again")
+			req2, err := http.NewRequest(http.MethodGet, webapiBase+"/api/v1/pins", nil)
+			Expect(err).NotTo(HaveOccurred())
+			req2.Header.Set("Authorization", "Bearer "+bearerToken)
+			resp2, err := http.DefaultClient.Do(req2)
+			Expect(err).NotTo(HaveOccurred())
+			defer resp2.Body.Close()
+			var body struct {
+				Pins []interface{} `json:"pins"`
+			}
+			Expect(json.NewDecoder(resp2.Body).Decode(&body)).To(Succeed())
+			Expect(body.Pins).To(BeEmpty(), "pin list should be empty after unpin")
+		})
+	})
+
+	// Notifications — e2e coverage for create / list / mark-read against a live cluster.
+	Context("Notifications", func() {
+		var (
+			webapiBase     string
+			pfCmd          *exec.Cmd
+			// userToken is for list/mark-read — regular authenticated user.
+			userToken      string
+			// adminToken is for POST /api/v1/admin/notifications — requires admin group.
+			adminToken     string
+			notificationID string
+		)
+
+		BeforeAll(func() {
+			By("Acquiring tokens from Keycloak")
+			userToken  = acquireToken(kcTestUser, kcTestPassword)
+			adminToken = acquireToken(kcAdminUser, kcAdminPassword)
+
+			By("Port-forwarding to webapi on :18085")
+			pfCmd = exec.Command("kubectl", "port-forward",
+				"-n", e2eNamespace, fmt.Sprintf("svc/%s", e2eWebapiService), "18085:8080")
+			Expect(pfCmd.Start()).NotTo(HaveOccurred())
+			webapiBase = "http://localhost:18085"
+
+			Eventually(func() error {
+				resp, err := http.Get(webapiBase + "/api/v1/health")
+				if err != nil {
+					return err
+				}
+				resp.Body.Close()
+				return nil
+			}, 30*time.Second, time.Second).Should(Succeed())
+		})
+
+		AfterAll(func() {
+			if pfCmd != nil && pfCmd.Process != nil {
+				_ = pfCmd.Process.Kill()
+			}
+		})
+
+		It("should reject non-admin notification creation with 403", func() {
+			body := `{"title":"E2E Negative","message":"should not persist"}`
+			req, err := http.NewRequest(http.MethodPost,
+				webapiBase+"/api/v1/admin/notifications",
+				strings.NewReader(body))
+			Expect(err).NotTo(HaveOccurred())
+			req.Header.Set("Authorization", "Bearer "+userToken)
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := http.DefaultClient.Do(req)
+			Expect(err).NotTo(HaveOccurred())
+			defer resp.Body.Close()
+			Expect(resp.StatusCode).To(Equal(http.StatusForbidden),
+				"non-admin POST /api/v1/admin/notifications must be 403 (requireAdmin)")
+		})
+
+		It("should create a notification as admin", func() {
+			body := `{"title":"E2E Test Notification","message":"Created during e2e test"}`
+			req, err := http.NewRequest(http.MethodPost,
+				webapiBase+"/api/v1/admin/notifications",
+				strings.NewReader(body))
+			Expect(err).NotTo(HaveOccurred())
+			req.Header.Set("Authorization", "Bearer "+adminToken)
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := http.DefaultClient.Do(req)
+			Expect(err).NotTo(HaveOccurred())
+			defer resp.Body.Close()
+			Expect(resp.StatusCode).To(Equal(http.StatusCreated),
+				"POST /api/v1/admin/notifications must return 201")
+			var notif struct {
+				ID    string `json:"id"`
+				Title string `json:"title"`
+			}
+			Expect(json.NewDecoder(resp.Body).Decode(&notif)).To(Succeed())
+			Expect(notif.ID).NotTo(BeEmpty())
+			Expect(notif.Title).To(Equal("E2E Test Notification"))
+			notificationID = notif.ID
+		})
+
+		It("should list notifications and include the created one", func() {
+			req, err := http.NewRequest(http.MethodGet,
+				webapiBase+"/api/v1/notifications", nil)
+			Expect(err).NotTo(HaveOccurred())
+			req.Header.Set("Authorization", "Bearer "+userToken)
+			resp, err := http.DefaultClient.Do(req)
+			Expect(err).NotTo(HaveOccurred())
+			defer resp.Body.Close()
+			Expect(resp.StatusCode).To(Equal(http.StatusOK))
+			var body struct {
+				Notifications []map[string]interface{} `json:"notifications"`
+			}
+			Expect(json.NewDecoder(resp.Body).Decode(&body)).To(Succeed())
+			ids := make([]string, 0, len(body.Notifications))
+			for _, n := range body.Notifications {
+				if id, ok := n["id"].(string); ok {
+					ids = append(ids, id)
+				}
+			}
+			Expect(ids).To(ContainElement(notificationID),
+				"notification list must include the newly created notification")
+		})
+
+		It("should mark the notification as read", func() {
+			req, err := http.NewRequest(http.MethodPut,
+				webapiBase+"/api/v1/notifications/"+notificationID+"/read", nil)
+			Expect(err).NotTo(HaveOccurred())
+			req.Header.Set("Authorization", "Bearer "+userToken)
+			resp, err := http.DefaultClient.Do(req)
+			Expect(err).NotTo(HaveOccurred())
+			defer resp.Body.Close()
+			Expect(resp.StatusCode).To(Equal(http.StatusNoContent),
+				"PUT /api/v1/notifications/{id}/read must return 204")
+
+			By("Verifying the notification is marked read in the list")
+			req2, err := http.NewRequest(http.MethodGet,
+				webapiBase+"/api/v1/notifications", nil)
+			Expect(err).NotTo(HaveOccurred())
+			req2.Header.Set("Authorization", "Bearer "+userToken)
+			resp2, err := http.DefaultClient.Do(req2)
+			Expect(err).NotTo(HaveOccurred())
+			defer resp2.Body.Close()
+			var body struct {
+				Notifications []map[string]interface{} `json:"notifications"`
+			}
+			Expect(json.NewDecoder(resp2.Body).Decode(&body)).To(Succeed())
+			for _, n := range body.Notifications {
+				if id, _ := n["id"].(string); id == notificationID {
+					Expect(n["read"]).To(BeTrue(),
+						"notification should be marked read for the same user")
+					return
+				}
+			}
+			Fail("notification " + notificationID + " not found in list after marking read")
+		})
+	})
+
+	// Access Requests — e2e coverage for request / admin-list / approve flow.
+	// userToken (test-user) submits the request; adminToken (admin group member)
+	// lists and approves it.
+	Context("Access Requests", func() {
+		var (
+			webapiBase  string
+			pfCmd       *exec.Cmd
+			// userToken is for the requester side (any authenticated user).
+			userToken   string
+			// adminToken is for admin-gated endpoints (requires "admin" group).
+			adminToken    string
+			serviceUID    string
+			requestID     string
+			denyRequestID string
+			arAppName     = "test-ar-app"
+		)
+
+		BeforeAll(func() {
+			By("Acquiring tokens from Keycloak")
+			userToken  = acquireToken(kcTestUser, kcTestPassword)
+			adminToken = acquireToken(kcAdminUser, kcAdminPassword)
+
+			By("Creating a NebariApp to request access to")
+			arApp := newNebariApp(arAppName, e2eNamespace,
+				fmt.Sprintf("%s.nebari.test", arAppName), "authenticated", 77)
+			Expect(k8sClient.Create(context.Background(), arApp)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(context.Background(), arApp) })
+
+			By("Port-forwarding to webapi on :18086")
+			pfCmd = exec.Command("kubectl", "port-forward",
+				"-n", e2eNamespace, fmt.Sprintf("svc/%s", e2eWebapiService), "18086:8080")
+			Expect(pfCmd.Start()).NotTo(HaveOccurred())
+			webapiBase = "http://localhost:18086"
+
+			Eventually(func() error {
+				resp, err := http.Get(webapiBase + "/api/v1/health")
+				if err != nil {
+					return err
+				}
+				resp.Body.Close()
+				return nil
+			}, 30*time.Second, time.Second).Should(Succeed())
+
+			By("Waiting for watcher to surface the NebariApp and extracting service UID")
+			Eventually(func() error {
+				req, err := http.NewRequest(http.MethodGet, webapiBase+"/api/v1/services", nil)
+				if err != nil {
+					return err
+				}
+				req.Header.Set("Authorization", "Bearer "+userToken)
+				resp, err := http.DefaultClient.Do(req)
+				if err != nil {
+					return err
+				}
+				defer resp.Body.Close()
+				var result ServiceListResponse
+				if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+					return err
+				}
+				for _, svc := range result.Services {
+					if name, _ := svc["name"].(string); name == "Test Service "+arAppName {
+						if uid, _ := svc["id"].(string); uid != "" {
+							serviceUID = uid
+							return nil
+						}
+					}
+				}
+				return fmt.Errorf("service %q not yet visible", arAppName)
+			}, VeryLongTimeout, 2*time.Second).Should(Succeed())
+		})
+
+		AfterAll(func() {
+			if pfCmd != nil && pfCmd.Process != nil {
+				_ = pfCmd.Process.Kill()
+			}
+		})
+
+		It("should reject unauthenticated access requests with 401", func() {
+			resp, err := http.Post(
+				webapiBase+"/api/v1/services/"+serviceUID+"/request_access",
+				"application/json", nil)
+			Expect(err).NotTo(HaveOccurred())
+			defer resp.Body.Close()
+			Expect(resp.StatusCode).To(Equal(http.StatusUnauthorized))
+		})
+
+		It("should create an access request for an authenticated user", func() {
+			// Body field must match RequestAccessBody.Message (json:"message")
+			// declared in internal/api/handlers.go. The decoder doesn't reject
+			// unknown fields, so a wrong key (e.g. "reason") would silently
+			// persist an empty message and the test would still see 202.
+			body := `{"message":"need access for e2e test"}`
+			req, err := http.NewRequest(http.MethodPost,
+				webapiBase+"/api/v1/services/"+serviceUID+"/request_access",
+				strings.NewReader(body))
+			Expect(err).NotTo(HaveOccurred())
+			req.Header.Set("Authorization", "Bearer "+userToken)
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := http.DefaultClient.Do(req)
+			Expect(err).NotTo(HaveOccurred())
+			defer resp.Body.Close()
+			Expect(resp.StatusCode).To(Equal(http.StatusAccepted),
+				"POST /api/v1/services/{uid}/request_access must return 202")
+			var ar struct {
+				ID     string `json:"id"`
+				Status string `json:"status"`
+			}
+			Expect(json.NewDecoder(resp.Body).Decode(&ar)).To(Succeed())
+			Expect(ar.ID).NotTo(BeEmpty())
+			Expect(ar.Status).To(Equal("pending"))
+			requestID = ar.ID
+		})
+
+		It("should reject non-admin GET /admin/access-requests with 403", func() {
+			req, err := http.NewRequest(http.MethodGet,
+				webapiBase+"/api/v1/admin/access-requests", nil)
+			Expect(err).NotTo(HaveOccurred())
+			req.Header.Set("Authorization", "Bearer "+userToken)
+			resp, err := http.DefaultClient.Do(req)
+			Expect(err).NotTo(HaveOccurred())
+			defer resp.Body.Close()
+			Expect(resp.StatusCode).To(Equal(http.StatusForbidden),
+				"non-admin GET /api/v1/admin/access-requests must be 403 (requireAdmin)")
+		})
+
+		It("should list the access request as admin", func() {
+			req, err := http.NewRequest(http.MethodGet,
+				webapiBase+"/api/v1/admin/access-requests", nil)
+			Expect(err).NotTo(HaveOccurred())
+			req.Header.Set("Authorization", "Bearer "+adminToken)
+			resp, err := http.DefaultClient.Do(req)
+			Expect(err).NotTo(HaveOccurred())
+			defer resp.Body.Close()
+			Expect(resp.StatusCode).To(Equal(http.StatusOK),
+				"GET /api/v1/admin/access-requests must return 200 (requires admin group)")
+			var body struct {
+				AccessRequests []map[string]interface{} `json:"accessRequests"`
+			}
+			Expect(json.NewDecoder(resp.Body).Decode(&body)).To(Succeed())
+			// Find the request we just created and deep-assert the persisted
+			// message field. This is the gate against the schema-mismatch class
+			// of bug: the handler's JSON decoder doesn't DisallowUnknownFields,
+			// so a wrong body key (e.g. "reason" vs "message") would still
+			// return 202 with an empty message — only this assertion catches it.
+			var found map[string]interface{}
+			for _, r := range body.AccessRequests {
+				if id, _ := r["id"].(string); id == requestID {
+					found = r
+					break
+				}
+			}
+			Expect(found).NotTo(BeNil(), "created access request %s not in admin list", requestID)
+			Expect(found["message"]).To(Equal("need access for e2e test"),
+				"persisted message must match request body — empty value indicates the body key didn't match RequestAccessBody.Message")
+		})
+
+		It("should reject non-admin PUT .../approve with 403", func() {
+			req, err := http.NewRequest(http.MethodPut,
+				webapiBase+"/api/v1/admin/access-requests/"+requestID+"/approve", nil)
+			Expect(err).NotTo(HaveOccurred())
+			req.Header.Set("Authorization", "Bearer "+userToken)
+			resp, err := http.DefaultClient.Do(req)
+			Expect(err).NotTo(HaveOccurred())
+			defer resp.Body.Close()
+			Expect(resp.StatusCode).To(Equal(http.StatusForbidden),
+				"non-admin PUT /api/v1/admin/access-requests/{id}/approve must be 403 (requireAdmin)")
+		})
+
+		It("should approve the access request as admin", func() {
+			req, err := http.NewRequest(http.MethodPut,
+				webapiBase+"/api/v1/admin/access-requests/"+requestID+"/approve", nil)
+			Expect(err).NotTo(HaveOccurred())
+			req.Header.Set("Authorization", "Bearer "+adminToken)
+			resp, err := http.DefaultClient.Do(req)
+			Expect(err).NotTo(HaveOccurred())
+			defer resp.Body.Close()
+			Expect(resp.StatusCode).To(Equal(http.StatusOK),
+				"PUT /api/v1/admin/access-requests/{id}/approve must return 200")
+			var ar struct {
+				Status string `json:"status"`
+			}
+			Expect(json.NewDecoder(resp.Body).Decode(&ar)).To(Succeed())
+			Expect(ar.Status).To(Equal("approved"))
+		})
+
+		It("should create a second access request for the deny path", func() {
+			// A second AR is needed because the first was just approved; once
+			// resolved, an AR can't be denied. Same user/service is fine since
+			// ErrDuplicatePending only triggers while a request is still pending.
+			body := `{"message":"second request to be denied"}`
+			req, err := http.NewRequest(http.MethodPost,
+				webapiBase+"/api/v1/services/"+serviceUID+"/request_access",
+				strings.NewReader(body))
+			Expect(err).NotTo(HaveOccurred())
+			req.Header.Set("Authorization", "Bearer "+userToken)
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := http.DefaultClient.Do(req)
+			Expect(err).NotTo(HaveOccurred())
+			defer resp.Body.Close()
+			Expect(resp.StatusCode).To(Equal(http.StatusAccepted))
+			var ar struct {
+				ID     string `json:"id"`
+				Status string `json:"status"`
+			}
+			Expect(json.NewDecoder(resp.Body).Decode(&ar)).To(Succeed())
+			Expect(ar.ID).NotTo(BeEmpty())
+			Expect(ar.Status).To(Equal("pending"))
+			denyRequestID = ar.ID
+		})
+
+		It("should deny the access request as admin", func() {
+			req, err := http.NewRequest(http.MethodPut,
+				webapiBase+"/api/v1/admin/access-requests/"+denyRequestID+"/deny", nil)
+			Expect(err).NotTo(HaveOccurred())
+			req.Header.Set("Authorization", "Bearer "+adminToken)
+			resp, err := http.DefaultClient.Do(req)
+			Expect(err).NotTo(HaveOccurred())
+			defer resp.Body.Close()
+			Expect(resp.StatusCode).To(Equal(http.StatusOK),
+				"PUT /api/v1/admin/access-requests/{id}/deny must return 200")
+			var ar struct {
+				Status string `json:"status"`
+			}
+			Expect(json.NewDecoder(resp.Body).Decode(&ar)).To(Succeed())
+			Expect(ar.Status).To(Equal("denied"))
 		})
 	})
 })
