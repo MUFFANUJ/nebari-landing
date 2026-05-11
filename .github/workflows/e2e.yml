@@ -70,32 +70,46 @@ jobs:
           restore-keys: |
             go-${{ runner.os }}-
 
-      # ── Webapi image (built before cluster so it's ready to import) ──────────
-      # Buildx + GHA layer cache — first run primes the cache (~94s),
-      # subsequent runs skip unchanged layers (~20-30s).
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build webapi image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          tags: nebari-landing/webapi:dev
-          load: true
-          cache-from: type=gha,scope=e2e-webapi
-          cache-to: type=gha,mode=max,scope=e2e-webapi
+      # ── Branch-tagged webapi image (published by webapi.yml) ─────────────────
+      # webapi.yml builds and pushes quay.io/nebari/nebari-webapi:<branch-tag>
+      # on every PR push. Reuse that image here instead of building a second
+      # one locally — single source of truth, less duplicated CI time.
+      - name: Compute branch tag
+        id: branch
+        run: |
+          BRANCH="${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}"
+          TAG=$(echo "$BRANCH" | sed 's/\//-/g' | sed 's/[^a-zA-Z0-9._-]//g')
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
       # ── Kubernetes cluster + Nebari platform ─────────────────────────────────
+      # The image override below is applied via a Git commit to the local
+      # file:// gitops repo ArgoCD reads from, so ArgoCD's auto-sync converges
+      # on it as desired state — no cluster-side patch to revert, no need for
+      # an argocd-self-heal toggle. Pinned to @main until v1.1+ is cut.
       - name: Setup Nebari Sandbox
         id: sandbox
-        uses: nebari-dev/action-nebari-sandbox@v1.0.1
+        uses: nebari-dev/action-nebari-sandbox@main
         with:
           profile: platform
           cluster-name: nebari-e2e
 
-      # ── Load webapi image into k3d ────────────────────────────────────────────
-      - name: Load webapi image into k3d
-        run: k3d image import nebari-landing/webapi:dev -c ${{ steps.sandbox.outputs.cluster-name }}
+      # ── Wait for the PR-tagged webapi image on Quay ──────────────────────────
+      # webapi.yml runs in parallel with this workflow on the same SHA. Block
+      # here until its manifest job has published the branch tag so the rollout
+      # step below has something to pull.
+      - name: Wait for webapi PR image on Quay
+        run: |
+          IMAGE="quay.io/nebari/nebari-webapi:${{ steps.branch.outputs.tag }}"
+          for i in $(seq 1 60); do
+            if docker manifest inspect "$IMAGE" >/dev/null 2>&1; then
+              echo "✔ $IMAGE is available"
+              exit 0
+            fi
+            echo "  attempt $i/60 — waiting for $IMAGE …"
+            sleep 10
+          done
+          echo "✗ $IMAGE never became available"
+          exit 1
 
       # ── NebariApp CRD ─────────────────────────────────────────────────────────
       # Apply directly so the tests don't depend on ArgoCD sync timing.
@@ -150,6 +164,138 @@ jobs:
           kubectl -n argocd get application nebari-landingpage -o yaml 2>/dev/null | head -80 || true
           exit 1
 
+      # ── Swap webapi to the PR-tagged image (via GitOps source) ──────────────
+      # Patch the local file:// GitOps repo that ArgoCD reads from so Git
+      # itself becomes the source of truth for the PR image. A direct
+      # `kubectl set image` is not enough — ArgoCD's reconciler still
+      # auto-syncs the Application on its periodic refresh and reverts
+      # cluster-side patches even with selfHeal off.
+      - name: Override webapi image in GitOps source
+        env:
+          GITOPS_DIR: ${{ steps.sandbox.outputs.gitops-dir }}
+          NEW_TAG: ${{ steps.branch.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${GITOPS_DIR}" || ! -d "${GITOPS_DIR}" ]]; then
+            echo "✗ gitops-dir not set or not a directory: ${GITOPS_DIR:-<empty>}"
+            exit 1
+          fi
+
+          # NIC writes manifests as Git objects but does not leave a checked-out
+          # working tree, so a plain grep finds nothing. Dump repo state then
+          # populate the working tree on the branch ArgoCD reads from.
+          export GIT_CONFIG_GLOBAL=/dev/null
+          git -C "${GITOPS_DIR}" config --local --add safe.directory "${GITOPS_DIR}" || true
+
+          echo "::group::GitOps repo state"
+          echo "--- branches ---"
+          git -C "${GITOPS_DIR}" branch -a || true
+          echo "--- HEAD ---"
+          git -C "${GITOPS_DIR}" rev-parse --abbrev-ref HEAD || true
+          git -C "${GITOPS_DIR}" log --oneline -5 HEAD || true
+          echo "--- ls-tree -r HEAD (first 50) ---"
+          git -C "${GITOPS_DIR}" ls-tree -r HEAD --name-only | head -50 || true
+          echo "::endgroup::"
+
+          # Pick the branch ArgoCD reads from (main per NIC config), falling
+          # back to HEAD if main does not exist on this NIC build.
+          BRANCH=main
+          if ! git -C "${GITOPS_DIR}" rev-parse --verify "refs/heads/${BRANCH}" >/dev/null 2>&1; then
+            BRANCH=$(git -C "${GITOPS_DIR}" rev-parse --abbrev-ref HEAD)
+            echo "  (no 'main' branch — falling back to HEAD branch: ${BRANCH})"
+          fi
+
+          echo "::group::Populate working tree from ${BRANCH}"
+          # Switch to the branch (if needed) and force a checkout so manifest
+          # files appear in the working tree.
+          git -C "${GITOPS_DIR}" checkout -f "${BRANCH}" 2>&1 || true
+          git -C "${GITOPS_DIR}" status --short | head -20 || true
+          echo "--- working tree files (top 30) ---"
+          find "${GITOPS_DIR}" -maxdepth 6 -type f -not -path '*/\.git/*' | head -30 || true
+          echo "::endgroup::"
+
+          # The chart's image is pinned by targetRevision (v0.1.0-alpha.4) and
+          # the gitops repo's Application does not redeclare it. Override the
+          # image tag by injecting into the existing inline values block of
+          # apps/nebari-landingpage.yaml.
+          APP_FILE="${GITOPS_DIR}/apps/nebari-landingpage.yaml"
+          if [[ ! -f "${APP_FILE}" ]]; then
+            echo "✗ expected Application file not found: ${APP_FILE}"
+            exit 1
+          fi
+
+          echo "::group::Inject webapi.image override into ${APP_FILE}"
+          before=$(sha1sum "${APP_FILE}" | cut -d' ' -f1)
+          # Insert an "image:" block immediately under the "webapi:" key in the
+          # inline values. The indent (10 spaces) matches the surrounding YAML
+          # produced by NIC's template.
+          NEW_TAG="$NEW_TAG" perl -0777 -i -pe '
+            s/^(        webapi:\n)(?!          image:)/$1."          image:\n            tag: \"$ENV{NEW_TAG}\"\n"/me;
+          ' "${APP_FILE}"
+          after=$(sha1sum "${APP_FILE}" | cut -d' ' -f1)
+          if [[ "$before" == "$after" ]]; then
+            echo "✗ patch left ${APP_FILE} unchanged — file content:"
+            cat "${APP_FILE}"
+            exit 1
+          fi
+          echo "  patched: ${APP_FILE}"
+          echo "::endgroup::"
+
+          echo "::group::Diff in GitOps repo"
+          git -C "${GITOPS_DIR}" --no-pager diff || true
+          echo "::endgroup::"
+
+          echo "::group::Commit override to local file:// repo"
+          if git -C "${GITOPS_DIR}" diff --quiet; then
+            echo "✗ patch produced no changes — selectors did not match expected layout"
+            exit 1
+          fi
+          git -C "${GITOPS_DIR}" \
+            -c user.email=ci@e2e \
+            -c user.name="e2e bot" \
+            commit -am "ci: override webapi image tag to ${NEW_TAG} for e2e"
+          echo "::endgroup::"
+
+          echo "::group::Refresh ArgoCD nebari-landingpage Application"
+          kubectl -n argocd annotate application nebari-landingpage \
+            argocd.argoproj.io/refresh=hard --overwrite
+          echo "::endgroup::"
+
+          echo "::group::Wait for ArgoCD to apply the override to the deployment"
+          # Poll until spec.image actually matches the PR tag. ArgoCD's sync
+          # can take 3-4 min after the Git commit, and previously we exited
+          # the loop too early — kubectl rollout status then reported on an
+          # in-flight rollout that ArgoCD subsequently superseded, leaving
+          # the running pods on the wrong image when the suite started.
+          TARGET_IMAGE="quay.io/nebari/nebari-webapi:${NEW_TAG}"
+          applied=false
+          for i in $(seq 1 60); do
+            cur=$(kubectl -n nebari-system get deployment nebari-landing-webapi \
+              -o jsonpath='{.spec.template.spec.containers[?(@.name=="webapi")].image}' \
+              2>/dev/null || echo "")
+            if [[ "$cur" == "$TARGET_IMAGE" ]]; then
+              echo "  ArgoCD applied the override (spec.image = $cur)"
+              applied=true
+              break
+            fi
+            echo "  attempt $i/60 — deployment image still '$cur', waiting 10s …"
+            sleep 10
+          done
+          if ! $applied; then
+            echo "✗ ArgoCD never applied the override; dumping Application state:"
+            kubectl -n argocd get application nebari-landingpage -o yaml 2>/dev/null \
+              | head -120 || true
+            exit 1
+          fi
+          echo "::endgroup::"
+
+          echo "::group::Wait for rollout to complete on the PR image"
+          # Now that spec.image is fixed at the PR tag, this rollout-status
+          # is guaranteed to wait on a rollout that produces PR-image pods.
+          kubectl -n nebari-system rollout status \
+            deployment/nebari-landing-webapi --timeout=5m
+          echo "::endgroup::"
+
       # ── Read nebari realm admin password ─────────────────────────────────────
       # NIC creates nebari-realm-admin-credentials in the keycloak namespace
       # with a randomly-generated password (separate from the master realm admin
@@ -178,7 +324,6 @@ jobs:
           USE_EXISTING_CLUSTER: "true"
           CLUSTER_TYPE: k3d
           K3D_CLUSTER_NAME: ${{ steps.sandbox.outputs.cluster-name }}
-          WEBAPI_IMG: nebari-landing/webapi:dev
           # Password for the 'admin' user in the nebari realm (not the master realm).
           E2E_KEYCLOAK_ADMIN_PASSWORD: ${{ env.NEBARI_REALM_ADMIN_PASSWORD }}
           # Client secret for the operator-provisioned nebari-landing OIDC client.

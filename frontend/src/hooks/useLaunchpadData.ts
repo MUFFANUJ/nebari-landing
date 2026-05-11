@@ -6,6 +6,7 @@ import {
   type Notification,
 } from "../api/notifications";
 import { createWebSocketClient } from "../api/ws";
+import { apiFetch } from "../api/client";
 import { mapService } from "../api/mapServices";
 import { deletePin, putPin } from "../api/pin";
 import type { ServiceSocketMessage } from "../api/servicesSocket";
@@ -85,11 +86,35 @@ export function useLaunchpadData(user: unknown) {
     []
   );
 
+  // The useMemo dependency on `user` rebuilds this WS client whenever the
+  // auth state flips. On a fresh page load that typically fires twice: once
+  // on initial mount with user=null (the ticket POST may 401, the silent
+  // fallback below kicks in), and once after keycloak-js resolves and user
+  // becomes the parsed claims. Two /ws-ticket POSTs per page load is
+  // expected. Steady state is one redeemed ticket per WS lifetime — a
+  // sustained drumbeat of fresh POSTs without disconnect events would
+  // indicate a real reconnect storm.
   const appSocket = useMemo(() => {
     const isAuthenticated = Boolean(user);
 
     return createWebSocketClient<AppSocketMessage>({
       path: "/ws",
+      // Fetch a fresh single-use ticket before each connect (and each reconnect).
+      // Browsers cannot send Authorization headers on WebSocket upgrade requests,
+      // so the webapi accepts a short-lived ticket as an alternative.
+      // When the exchange fails (e.g. auth disabled in dev), connect without a ticket.
+      getQueryParams: async () => {
+        try {
+          const resp = await apiFetch("/ws-ticket", { method: "POST" });
+          if (resp.ok) {
+            const data = await resp.json() as { ticket: string };
+            return { ticket: data.ticket };
+          }
+        } catch {
+          // Ticket exchange failed — proceed without one (auth-disabled dev mode).
+        }
+        return {};
+      },
       onOpen: () =>
         console.log("app websocket connected", { authenticated: isAuthenticated }),
       onClose: () => console.log("app websocket disconnected"),

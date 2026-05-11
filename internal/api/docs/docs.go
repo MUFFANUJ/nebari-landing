@@ -211,6 +211,14 @@ const docTemplate = `{
                 },
                 "type": "object"
             },
+            "api.WSTicketResponse": {
+                "properties": {
+                    "ticket": {
+                        "type": "string"
+                    }
+                },
+                "type": "object"
+            },
             "cache.HealthStatus": {
                 "properties": {
                     "lastCheck": {
@@ -1279,7 +1287,17 @@ const docTemplate = `{
         },
         "/ws": {
             "get": {
-                "description": "Upgrade to WebSocket. Server pushes JSON envelopes for service add/update/delete and new notifications. The same auth gate as protected REST endpoints applies before the upgrade is accepted.",
+                "description": "Upgrade to WebSocket. Server pushes JSON envelopes for service add/update/delete and new notifications. Auth is required before the upgrade: send ` + "`" + `Authorization: Bearer \u003ctoken\u003e` + "`" + ` or pass ` + "`" + `?ticket=\u003cid\u003e` + "`" + ` from POST /api/v1/ws-ticket (browsers must use the ticket path).",
+                "parameters": [
+                    {
+                        "description": "Single-use ticket from POST /api/v1/ws-ticket (required for browser clients)",
+                        "in": "query",
+                        "name": "ticket",
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                ],
                 "responses": {
                     "101": {
                         "content": {
@@ -1308,6 +1326,62 @@ const docTemplate = `{
                     }
                 ],
                 "summary": "WebSocket: real-time service + notification events",
+                "tags": [
+                    "websocket"
+                ]
+            }
+        },
+        "/ws-ticket": {
+            "post": {
+                "description": "Mints a short-lived (~30 s) single-use ticket the browser passes as ` + "`" + `?ticket=\u003cid\u003e` + "`" + ` on the WebSocket upgrade request, since the WS spec forbids sending an Authorization header on the upgrade. Requires a Bearer JWT.",
+                "responses": {
+                    "200": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/api.WSTicketResponse"
+                                }
+                            }
+                        },
+                        "description": "OK"
+                    },
+                    "401": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "string"
+                                }
+                            }
+                        },
+                        "description": "Unauthorized"
+                    },
+                    "405": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "string"
+                                }
+                            }
+                        },
+                        "description": "Method Not Allowed"
+                    },
+                    "501": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "string"
+                                }
+                            }
+                        },
+                        "description": "WebSocket ticket exchange not configured"
+                    }
+                },
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "summary": "Issue a single-use WebSocket ticket",
                 "tags": [
                     "websocket"
                 ]

@@ -19,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gorilla/websocket"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
@@ -386,18 +387,6 @@ var _ = Describe("Webapi – Service Discovery", Ordered, func() {
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred(), "helm upgrade --install should succeed")
 		}
-
-		By("Patching webapi deployment image to configured image")
-		// Always override the image so the deployment uses the locally built
-		// version that matches this codebase.  For existing clusters this
-		// corrects drift; for freshly installed charts it is a no-op when
-		// the helm --set already matched.
-		setImg := exec.Command("kubectl", "set", "image",
-			fmt.Sprintf("deployment/%s", e2eWebapiDeployment),
-			"-n", namespace,
-			fmt.Sprintf("webapi=%s", webapiImage))
-		_, err = utils.Run(setImg)
-		Expect(err).NotTo(HaveOccurred(), "Failed to patch webapi container image")
 
 		By("Patching webapi deployment with discovered KEYCLOAK_ISSUER_URL and ENABLE_DOCS=true")
 		// The issuer in tokens is set by KC_HOSTNAME_URL (e.g. http://<minikube-lb-ip>).
@@ -1141,6 +1130,87 @@ var _ = Describe("Webapi – Service Discovery", Ordered, func() {
 			}
 			Expect(json.NewDecoder(resp.Body).Decode(&ar)).To(Succeed())
 			Expect(ar.Status).To(Equal("denied"))
+		})
+	})
+
+	// WebSocket ticket exchange — validates the full chain that PKCE auth introduces:
+	// real Keycloak JWT → POST /ws-ticket → Redis-backed ticket → WS upgrade.
+	// Unit tests cover the store and handler logic in isolation; this confirms
+	// everything works end-to-end against a live cluster.
+	Context("WebSocket ticket exchange", Ordered, func() {
+		var (
+			webapiBase  string
+			pfCmd       *exec.Cmd
+			bearerToken string
+		)
+
+		BeforeAll(func() {
+			By("Acquiring a JWT from Keycloak via the operator-provisioned OIDC client")
+			bearerToken = acquireToken(kcTestUser, kcTestPassword)
+
+			By("Port-forwarding to webapi on :18083")
+			pfCmd = exec.Command("kubectl", "port-forward",
+				"-n", namespace, fmt.Sprintf("svc/%s", e2eWebapiService), "18083:8080")
+			Expect(pfCmd.Start()).NotTo(HaveOccurred())
+			webapiBase = "http://localhost:18083"
+
+			Eventually(func() error {
+				resp, err := http.Get(webapiBase + "/api/v1/health")
+				if err != nil {
+					return err
+				}
+				resp.Body.Close()
+				return nil
+			}, 30*time.Second, time.Second).Should(Succeed(),
+				"webapi must respond on :18083 before running ws-ticket tests")
+		})
+
+		AfterAll(func() {
+			if pfCmd != nil && pfCmd.Process != nil {
+				_ = pfCmd.Process.Kill()
+			}
+		})
+
+		It("should reject POST /api/v1/ws-ticket without a Bearer token", func() {
+			resp, err := http.Post(webapiBase+"/api/v1/ws-ticket", "", nil)
+			Expect(err).NotTo(HaveOccurred())
+			defer resp.Body.Close()
+			Expect(resp.StatusCode).To(Equal(http.StatusUnauthorized),
+				"unauthenticated ws-ticket request must return 401")
+		})
+
+		It("should mint a ticket, upgrade the WebSocket, and enforce single-use", func() {
+			By("POSTing /api/v1/ws-ticket with a valid Bearer token")
+			req, err := http.NewRequest(http.MethodPost, webapiBase+"/api/v1/ws-ticket", nil)
+			Expect(err).NotTo(HaveOccurred())
+			req.Header.Set("Authorization", "Bearer "+bearerToken)
+			resp, err := http.DefaultClient.Do(req)
+			Expect(err).NotTo(HaveOccurred())
+			defer resp.Body.Close()
+			Expect(resp.StatusCode).To(Equal(http.StatusOK),
+				"authenticated ws-ticket request must return 200")
+			var ticketResp struct {
+				Ticket string `json:"ticket"`
+			}
+			Expect(json.NewDecoder(resp.Body).Decode(&ticketResp)).To(Succeed())
+			ticket := ticketResp.Ticket
+			Expect(ticket).NotTo(BeEmpty(), "ticket must be non-empty")
+
+			By("Upgrading a WebSocket connection using the ticket")
+			wsURL := "ws://localhost:18083/api/v1/ws?ticket=" + ticket
+			conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+			Expect(err).NotTo(HaveOccurred(),
+				"WebSocket dial must succeed with a valid, unused ticket")
+			defer conn.Close()
+
+			By("Confirming the ticket is single-use — second dial must be rejected")
+			_, secondResp, dialErr := websocket.DefaultDialer.Dial(wsURL, nil)
+			Expect(dialErr).To(HaveOccurred(),
+				"second dial with the same ticket must fail")
+			if secondResp != nil {
+				defer secondResp.Body.Close()
+				Expect(secondResp.StatusCode).To(Equal(http.StatusUnauthorized))
+			}
 		})
 	})
 })
