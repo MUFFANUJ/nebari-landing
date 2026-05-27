@@ -29,9 +29,12 @@ export function ServiceGridCard({
             <StatusBadge status={service.status} />
           </div>
 
-          <div className="mt-4 block">
+          <div className="mt-4 min-h-0">
             <p className="text-base font-bold text-foreground">{service.name}</p>
-            <p className="mt-1 text-sm text-muted-foreground">
+            <p
+              className="mt-1 line-clamp-2 text-sm text-muted-foreground"
+              title={service.description}
+            >
               {service.description}
             </p>
           </div>
