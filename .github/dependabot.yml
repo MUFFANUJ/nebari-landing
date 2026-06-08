@@ -11,6 +11,9 @@ updates:
       # Ignore all React updates
       - dependency-name: "react"
       - dependency-name: "react-dom"
+      # Ignore Node 25+ updates
+      - dependency-name: "@types/node"
+        versions: [">=25"]
     groups:
       # Group all patch and minor updates into a single PR
       patch-and-minor:
