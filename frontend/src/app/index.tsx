@@ -1,13 +1,14 @@
 import { signOut } from "@/auth/keycloak";
 import { useUser } from "@/auth/user";
+
 import { Content } from "../components/Content";
 import { Header } from "../components/Header";
+import { useTheme } from "../hooks/ThemeContext";
 import { useLaunchpadData } from "../hooks/useLaunchpadData";
-import { useThemePreference } from "../hooks/useThemePreference";
 import { getAppConfig } from "./config";
 
 export default function App() {
-  const { isDarkMode, toggleTheme } = useThemePreference();
+  const { isDarkMode, toggleTheme } = useTheme();
   const { user } = useUser();
   const { services, notifications, onNotificationsViewed, onTogglePin } = useLaunchpadData(user);
 

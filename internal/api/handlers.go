@@ -331,7 +331,9 @@ type ServiceView struct {
 	Description string   `json:"description"`
 	Category    []string `json:"category"`
 	Pinned      bool     `json:"pinned"`
-	Image       string   `json:"image"`
+	Image       string   `json:"image,omitempty"`
+	ImageLight  string   `json:"imageLight,omitempty"`
+	ImageDark   string   `json:"imageDark,omitempty"`
 	URL         string   `json:"url"`
 }
 
@@ -362,6 +364,8 @@ func toServiceView(svc *cache.ServiceInfo, pinned bool) *ServiceView {
 		Category:    category,
 		Pinned:      pinned,
 		Image:       svc.Icon,
+		ImageLight:  svc.IconLight,
+		ImageDark:   svc.IconDark,
 		URL:         svc.URL,
 	}
 }

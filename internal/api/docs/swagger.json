@@ -189,6 +189,12 @@
                     "image": {
                         "type": "string"
                     },
+                    "imageDark": {
+                        "type": "string"
+                    },
+                    "imageLight": {
+                        "type": "string"
+                    },
                     "name": {
                         "type": "string"
                     },
@@ -242,6 +248,12 @@
                         "$ref": "#/components/schemas/cache.HealthStatus"
                     },
                     "icon": {
+                        "type": "string"
+                    },
+                    "iconDark": {
+                        "type": "string"
+                    },
+                    "iconLight": {
                         "type": "string"
                     },
                     "name": {

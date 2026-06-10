@@ -245,7 +245,7 @@ func (w *NebariAppWatcher) onAdd(obj interface{}) {
 				if svc.DisplayName != "" {
 					name = svc.DisplayName
 				}
-				icon = svc.Icon
+				icon = svc.IconURL()
 			}
 			w.postNotif(icon,
 				fmt.Sprintf("%s is now available", name),
@@ -290,7 +290,7 @@ func (w *NebariAppWatcher) onUpdate(_, newObj interface{}) {
 			if name == "" {
 				name = svc.Name
 			}
-			w.postNotif(svc.Icon,
+			w.postNotif(svc.IconURL(),
 				fmt.Sprintf("%s has been removed", name),
 				fmt.Sprintf("%s is no longer available on this Nebari deployment.", name),
 			)
@@ -320,7 +320,7 @@ func (w *NebariAppWatcher) onDelete(obj interface{}) {
 		if name == "" {
 			name = svc.Name
 		}
-		w.postNotif(svc.Icon,
+		w.postNotif(svc.IconURL(),
 			fmt.Sprintf("%s has been removed", name),
 			fmt.Sprintf("%s is no longer available on this Nebari deployment.", name),
 		)
@@ -378,6 +378,8 @@ func toApp(u *unstructured.Unstructured) *sdapp.App {
 	displayName, _, _ := unstructured.NestedString(u.Object, "spec", "landingPage", "displayName")
 	description, _, _ := unstructured.NestedString(u.Object, "spec", "landingPage", "description")
 	icon, _, _ := unstructured.NestedString(u.Object, "spec", "landingPage", "icon")
+	iconLight, _, _ := unstructured.NestedString(u.Object, "spec", "landingPage", "iconLight")
+	iconDark, _, _ := unstructured.NestedString(u.Object, "spec", "landingPage", "iconDark")
 	category, _, _ := unstructured.NestedString(u.Object, "spec", "landingPage", "category")
 	externalURL, _, _ := unstructured.NestedString(u.Object, "spec", "landingPage", "externalUrl")
 	// spec.landingPage no longer carries visibility or requiredGroups (removed from
@@ -422,6 +424,8 @@ func toApp(u *unstructured.Unstructured) *sdapp.App {
 		DisplayName:    displayName,
 		Description:    description,
 		Icon:           icon,
+		IconLight:      iconLight,
+		IconDark:       iconDark,
 		Category:       category,
 		Priority:       priority,
 		Visibility:     visibility,

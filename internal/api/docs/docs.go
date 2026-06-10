@@ -196,6 +196,12 @@ const docTemplate = `{
                     "image": {
                         "type": "string"
                     },
+                    "imageDark": {
+                        "type": "string"
+                    },
+                    "imageLight": {
+                        "type": "string"
+                    },
                     "name": {
                         "type": "string"
                     },
@@ -249,6 +255,12 @@ const docTemplate = `{
                         "$ref": "#/components/schemas/cache.HealthStatus"
                     },
                     "icon": {
+                        "type": "string"
+                    },
+                    "iconDark": {
+                        "type": "string"
+                    },
+                    "iconLight": {
                         "type": "string"
                     },
                     "name": {

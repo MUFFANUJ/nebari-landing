@@ -68,6 +68,8 @@ export const generatedHandlers = [
       description: "",
       id: "",
       image: "",
+      imageDark: "",
+      imageLight: "",
       name: "",
       pinned: false,
       status: "",
