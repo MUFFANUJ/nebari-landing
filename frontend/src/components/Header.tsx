@@ -93,7 +93,7 @@ export function Header(props: HeaderProps): ReactNode {
             <Button
               variant="ghost"
               size="icon"
-              className="relative h-9 w-9 rounded-[8px] border border-border bg-background text-muted-foreground transition-none hover:bg-accent"
+              className="relative h-9 w-9 rounded-[8px] border border-border bg-transparent text-muted-foreground transition-none hover:bg-accent"
               aria-label="Notifications"
             >
               <Bell className="h-5 w-5" />
