@@ -623,7 +623,7 @@ const docTemplate = `{
         },
         "/caller-identity": {
             "get": {
-                "description": "Echoes the resolved JWT claims for the caller. Returns {\"authenticated\": false} when no valid token is present.",
+                "description": "Echoes the resolved JWT claims for the caller. Returns {\"authenticated\": false} when no token is present.",
                 "responses": {
                     "200": {
                         "content": {
@@ -634,6 +634,16 @@ const docTemplate = `{
                             }
                         },
                         "description": "OK"
+                    },
+                    "401": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "string"
+                                }
+                            }
+                        },
+                        "description": "Unauthorized"
                     },
                     "405": {
                         "content": {
@@ -1082,6 +1092,16 @@ const docTemplate = `{
                         },
                         "description": "OK"
                     },
+                    "401": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "string"
+                                }
+                            }
+                        },
+                        "description": "Unauthorized"
+                    },
                     "405": {
                         "content": {
                             "application/json": {
@@ -1138,6 +1158,16 @@ const docTemplate = `{
                             }
                         },
                         "description": "Service ID is required"
+                    },
+                    "401": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "string"
+                                }
+                            }
+                        },
+                        "description": "Unauthorized"
                     },
                     "403": {
                         "content": {
