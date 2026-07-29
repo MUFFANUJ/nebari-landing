@@ -382,6 +382,13 @@ jobs:
           echo "::endgroup::"
 
           echo "::group::Wait for rollout to complete on the PR image"
+          # The sandbox currently deploys the released chart, so a PR webapi
+          # image can contain newer required env vars than that chart renders.
+          # Patch the e2e binding config before waiting for readiness; the
+          # test harness refreshes these env vars again after Keycloak setup.
+          kubectl -n nebari-system set env deployment/nebari-landing-webapi \
+            KEYCLOAK_AUDIENCE=nebari-landingpage \
+            KEYCLOAK_AUTHORIZED_PARTY=nebari-system-nebari-landing
           # Now that spec.image is fixed at the PR tag, this rollout-status
           # is guaranteed to wait on a rollout that produces PR-image pods.
           kubectl -n nebari-system rollout status \
