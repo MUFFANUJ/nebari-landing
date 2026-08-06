@@ -176,6 +176,7 @@ func (w *NebariAppWatcher) syncInitial(ctx context.Context) error {
 				"displayName", displayName,
 			)
 			w.cache.Add(toApp(u))
+			w.reportInvalidRequiredGroups(u, w.cache.Get(string(u.GetUID())))
 		}
 	}
 
@@ -232,13 +233,14 @@ func (w *NebariAppWatcher) onAdd(obj interface{}) {
 		)
 		w.cache.Add(toApp(u))
 		uid := string(u.GetUID())
+		svc := w.cache.Get(uid)
+		w.reportInvalidRequiredGroups(u, svc)
 		if w.publisher != nil {
-			w.publisher.Publish("added", w.cache.Get(uid))
+			w.publisher.Publish("added", svc)
 		}
 		// Only notify for services that appeared after startup; the informer
 		// replays existing objects via onAdd when event handlers are registered.
 		if !w.initialUIDs[uid] {
-			svc := w.cache.Get(uid)
 			name := u.GetName()
 			icon := ""
 			if svc != nil {
@@ -272,8 +274,10 @@ func (w *NebariAppWatcher) onUpdate(_, newObj interface{}) {
 			"displayName", displayName,
 		)
 		w.cache.Add(toApp(u))
+		svc := w.cache.Get(uid)
+		w.reportInvalidRequiredGroups(u, svc)
 		if w.publisher != nil {
-			w.publisher.Publish("modified", w.cache.Get(uid))
+			w.publisher.Publish("modified", svc)
 		}
 	} else {
 		log.Info("Service removed (landing page disabled)",
@@ -296,6 +300,18 @@ func (w *NebariAppWatcher) onUpdate(_, newObj interface{}) {
 			)
 		}
 	}
+}
+
+func (w *NebariAppWatcher) reportInvalidRequiredGroups(u *unstructured.Unstructured, svc *landingcache.ServiceInfo) {
+	if svc == nil || len(svc.InvalidRequiredGroups) == 0 {
+		return
+	}
+	log.Info("NebariApp auth.groups contains non-full Keycloak group paths; migrate them to explicit full paths before service access can be granted",
+		"name", u.GetName(),
+		"namespace", u.GetNamespace(),
+		"uid", string(u.GetUID()),
+		"invalidGroups", svc.InvalidRequiredGroups,
+	)
 }
 
 func (w *NebariAppWatcher) onDelete(obj interface{}) {
