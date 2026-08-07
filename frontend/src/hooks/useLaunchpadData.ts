@@ -14,10 +14,14 @@ export function useLaunchpadData(user: unknown) {
   const [services, setServices] = useState<Service[]>([]);
   const [notifications, setNotifications] = useState<Notification[]>([]);
 
-  useEffect(() => {
+  const refreshServices = useCallback(() => {
     listServices().then(setServices).catch(console.error);
+  }, []);
+
+  useEffect(() => {
+    refreshServices();
     listNotifications().then(setNotifications).catch(console.error);
-  }, [user]);
+  }, [user, refreshServices]);
 
   const onNotificationsViewed = useCallback(async (ids: string[]) => {
     const uniqueIds = [...new Set(ids)];
@@ -102,7 +106,10 @@ export function useLaunchpadData(user: unknown) {
         }
         return {};
       },
-      onOpen: () => console.log("app websocket connected", { authenticated: isAuthenticated }),
+      onOpen: () => {
+        console.log("app websocket connected", { authenticated: isAuthenticated });
+        refreshServices();
+      },
       onClose: () => console.log("app websocket disconnected"),
       onError: (event) => console.error("app websocket error", event),
       onMessage: (message) => {
@@ -165,7 +172,7 @@ export function useLaunchpadData(user: unknown) {
         });
       },
     });
-  }, [user]);
+  }, [user, refreshServices]);
 
   useEffect(() => {
     appSocket.connect();
