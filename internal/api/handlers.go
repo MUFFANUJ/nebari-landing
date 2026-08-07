@@ -836,6 +836,7 @@ func (h *Handler) handleGetNotifications(w http.ResponseWriter, r *http.Request)
 		if readSet == nil {
 			readSet = map[string]bool{}
 		}
+		approvedUIDs := h.callerApprovedServiceUIDs(claims, authenticated)
 
 		items = make([]NotificationItem, 0, len(notifs))
 		for _, n := range notifs {
@@ -849,7 +850,7 @@ func (h *Handler) handleGetNotifications(w http.ResponseWriter, r *http.Request)
 				if authenticated && claims != nil {
 					groups = claims.Groups
 				}
-				if !canAccessPolicy(n.Visibility, authenticated, n.RequiredGroups, groups) {
+				if !canAccessPolicy(n.Visibility, authenticated, n.RequiredGroups, groups, hasApprovedService(approvedUIDs, n.ServiceUID)) {
 					continue
 				}
 			}
