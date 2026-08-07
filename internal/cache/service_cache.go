@@ -275,7 +275,7 @@ func (c *ServiceCache) UpdateHealth(uid string, status *HealthStatus) {
 // health-check configuration. The read lock is held for fn so writers that
 // remove or replace cfg cannot interleave between the freshness check and the
 // protected operation.
-func (c *ServiceCache) ,(uid string, cfg *HealthCheckConfig, fn func(prevStatus string)) bool {
+func (c *ServiceCache) WithCurrentHealthCheck(uid string, cfg *HealthCheckConfig, fn func(prevStatus string)) bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
