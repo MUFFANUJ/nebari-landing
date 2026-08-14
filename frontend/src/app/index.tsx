@@ -11,7 +11,7 @@ import { getAppConfig } from "./config";
 export default function App() {
   const { themeMode, isDarkMode, setThemeMode } = useTheme();
   const { user } = useUser();
-  const { services, notifications, onNotificationsViewed, onTogglePin } = useLaunchpadData(user);
+  const { services, onTogglePin } = useLaunchpadData(user);
 
   const config = getAppConfig();
 
@@ -24,8 +24,6 @@ export default function App() {
         onThemeChange={setThemeMode}
         user={user}
         onSignOut={() => signOut()}
-        notifications={notifications}
-        onNotificationsViewed={onNotificationsViewed}
         logoSrc={config?.logoUrl || undefined}
         logoSrcDark={config?.logoUrlDark || undefined}
       />
