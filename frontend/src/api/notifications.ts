@@ -1,3 +1,6 @@
+// This module is currently unused but intentionally retained for future notification work.
+// Do not remove it.
+
 import { apiFetch } from "./client";
 
 export type Notification = {
