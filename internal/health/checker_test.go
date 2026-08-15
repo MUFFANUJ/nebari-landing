@@ -116,12 +116,6 @@ func TestProbeRunnerAllowsServiceNamespaceTarget(t *testing.T) {
 	}
 }
 
-type roundTripFunc func(*http.Request) (*http.Response, error)
-
-func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
-	return f(req)
-}
-
 type countingProbeRequester struct {
 	called bool
 }

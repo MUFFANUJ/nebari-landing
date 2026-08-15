@@ -37,7 +37,7 @@ func handleProbeRunnerRequest(w http.ResponseWriter, r *http.Request) {
 
 	var req remoteProbeRequest
 	body := http.MaxBytesReader(w, r.Body, maxProbeRunnerBodyBytes)
-	defer body.Close()
+	defer func() { _ = body.Close() }()
 	if err := json.NewDecoder(body).Decode(&req); err != nil {
 		http.Error(w, "invalid probe request", http.StatusBadRequest)
 		return
@@ -76,7 +76,7 @@ func validateProbeRunnerTarget(rawURL string) error {
 		return fmt.Errorf("probe URL must include a numeric port")
 	}
 	hostParts := strings.Split(parsed.Hostname(), ".")
-	if len(hostParts) != 2 && !(len(hostParts) >= 4 && hostParts[2] == "svc") {
+	if len(hostParts) != 2 && (len(hostParts) < 4 || hostParts[2] != "svc") {
 		return fmt.Errorf("probe URL must use service.namespace DNS")
 	}
 	serviceName := hostParts[0]
