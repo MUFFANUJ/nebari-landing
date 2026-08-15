@@ -638,7 +638,7 @@ func TestHandleDebug_IncludesJWTValidatorStatsAndCapsAuthorizationHeader(t *test
 	if body.Auth.JWTValidator.Ready {
 		t.Error("expected zero-value validator to report ready=false")
 	}
-	if !strings.Contains(body.Auth.ValidationError, "Authorization header exceeds maximum size") {
+	if !strings.Contains(body.Auth.ValidationError, "authorization header exceeds maximum size") {
 		t.Errorf("expected oversized header validation error, got %q", body.Auth.ValidationError)
 	}
 }

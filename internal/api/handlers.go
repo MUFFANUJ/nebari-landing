@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"strings"
@@ -1298,65 +1299,71 @@ func (h *Handler) handleMetrics(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 
+	// Accumulate the exposition into a buffer so a single write reports any
+	// error once, rather than ignoring the return value of every line.
+	var b strings.Builder
+
 	configured := 0
 	if h.jwtValidator != nil {
 		configured = 1
 	}
-	fmt.Fprintf(w, "# HELP nebari_landing_jwt_validator_configured Whether the JWT validator is configured.\n")
-	fmt.Fprintf(w, "# TYPE nebari_landing_jwt_validator_configured gauge\n")
-	fmt.Fprintf(w, "nebari_landing_jwt_validator_configured %d\n", configured)
+	fmt.Fprintf(&b, "# HELP nebari_landing_jwt_validator_configured Whether the JWT validator is configured.\n")
+	fmt.Fprintf(&b, "# TYPE nebari_landing_jwt_validator_configured gauge\n")
+	fmt.Fprintf(&b, "nebari_landing_jwt_validator_configured %d\n", configured)
 
-	if h.jwtValidator == nil {
-		return
+	if h.jwtValidator != nil {
+		stats := h.jwtValidator.Stats()
+		ready := 0
+		if stats.Ready {
+			ready = 1
+		}
+
+		fmt.Fprintf(&b, "# HELP nebari_landing_jwt_validator_ready Whether initial JWKS loading has completed.\n")
+		fmt.Fprintf(&b, "# TYPE nebari_landing_jwt_validator_ready gauge\n")
+		fmt.Fprintf(&b, "nebari_landing_jwt_validator_ready %d\n", ready)
+		fmt.Fprintf(&b, "# HELP nebari_landing_jwt_validator_keys Cached JWT signing keys.\n")
+		fmt.Fprintf(&b, "# TYPE nebari_landing_jwt_validator_keys gauge\n")
+		fmt.Fprintf(&b, "nebari_landing_jwt_validator_keys %d\n", stats.KeyCount)
+		if !stats.LastFetch.IsZero() {
+			fmt.Fprintf(&b, "# HELP nebari_landing_jwt_validator_last_fetch_timestamp_seconds Last successful JWKS fetch time.\n")
+			fmt.Fprintf(&b, "# TYPE nebari_landing_jwt_validator_last_fetch_timestamp_seconds gauge\n")
+			fmt.Fprintf(&b, "nebari_landing_jwt_validator_last_fetch_timestamp_seconds %d\n", stats.LastFetch.Unix())
+		}
+		if !stats.LastRefreshAttempt.IsZero() {
+			fmt.Fprintf(&b, "# HELP nebari_landing_jwt_validator_last_refresh_attempt_timestamp_seconds Last attempted JWKS refresh time.\n")
+			fmt.Fprintf(&b, "# TYPE nebari_landing_jwt_validator_last_refresh_attempt_timestamp_seconds gauge\n")
+			fmt.Fprintf(&b, "nebari_landing_jwt_validator_last_refresh_attempt_timestamp_seconds %d\n", stats.LastRefreshAttempt.Unix())
+		}
+
+		fmt.Fprintf(&b, "# HELP nebari_landing_jwks_refresh_attempts_total JWKS refresh attempts.\n")
+		fmt.Fprintf(&b, "# TYPE nebari_landing_jwks_refresh_attempts_total counter\n")
+		fmt.Fprintf(&b, "nebari_landing_jwks_refresh_attempts_total %d\n", stats.JWKSRefreshAttempts)
+		fmt.Fprintf(&b, "# HELP nebari_landing_jwks_refresh_successes_total Successful JWKS refreshes.\n")
+		fmt.Fprintf(&b, "# TYPE nebari_landing_jwks_refresh_successes_total counter\n")
+		fmt.Fprintf(&b, "nebari_landing_jwks_refresh_successes_total %d\n", stats.JWKSRefreshSuccesses)
+		fmt.Fprintf(&b, "# HELP nebari_landing_jwks_refresh_failures_total Failed JWKS refreshes.\n")
+		fmt.Fprintf(&b, "# TYPE nebari_landing_jwks_refresh_failures_total counter\n")
+		fmt.Fprintf(&b, "nebari_landing_jwks_refresh_failures_total %d\n", stats.JWKSRefreshFailures)
+		fmt.Fprintf(&b, "# HELP nebari_landing_jwks_refresh_skipped_total JWKS refreshes skipped by cooldown.\n")
+		fmt.Fprintf(&b, "# TYPE nebari_landing_jwks_refresh_skipped_total counter\n")
+		fmt.Fprintf(&b, "nebari_landing_jwks_refresh_skipped_total %d\n", stats.JWKSRefreshSkipped)
+		fmt.Fprintf(&b, "# HELP nebari_landing_jwks_refresh_coalesced_total JWKS refreshes coalesced while another refresh was running.\n")
+		fmt.Fprintf(&b, "# TYPE nebari_landing_jwks_refresh_coalesced_total counter\n")
+		fmt.Fprintf(&b, "nebari_landing_jwks_refresh_coalesced_total %d\n", stats.JWKSRefreshCoalesced)
+		fmt.Fprintf(&b, "# HELP nebari_landing_unknown_kid_total JWTs that referenced an unknown key ID.\n")
+		fmt.Fprintf(&b, "# TYPE nebari_landing_unknown_kid_total counter\n")
+		fmt.Fprintf(&b, "nebari_landing_unknown_kid_total %d\n", stats.UnknownKIDTotal)
+		fmt.Fprintf(&b, "# HELP nebari_landing_unknown_kid_cache_hits_total Unknown key IDs rejected from the negative cache.\n")
+		fmt.Fprintf(&b, "# TYPE nebari_landing_unknown_kid_cache_hits_total counter\n")
+		fmt.Fprintf(&b, "nebari_landing_unknown_kid_cache_hits_total %d\n", stats.UnknownKIDCacheHits)
+		fmt.Fprintf(&b, "# HELP nebari_landing_unknown_kid_cache_entries Unknown key IDs currently held in the negative cache.\n")
+		fmt.Fprintf(&b, "# TYPE nebari_landing_unknown_kid_cache_entries gauge\n")
+		fmt.Fprintf(&b, "nebari_landing_unknown_kid_cache_entries %d\n", stats.UnknownKIDCacheEntries)
 	}
 
-	stats := h.jwtValidator.Stats()
-	ready := 0
-	if stats.Ready {
-		ready = 1
+	if _, err := io.WriteString(w, b.String()); err != nil {
+		log.Info("Failed to write metrics response", "error", err, "path", r.URL.Path)
 	}
-
-	fmt.Fprintf(w, "# HELP nebari_landing_jwt_validator_ready Whether initial JWKS loading has completed.\n")
-	fmt.Fprintf(w, "# TYPE nebari_landing_jwt_validator_ready gauge\n")
-	fmt.Fprintf(w, "nebari_landing_jwt_validator_ready %d\n", ready)
-	fmt.Fprintf(w, "# HELP nebari_landing_jwt_validator_keys Cached JWT signing keys.\n")
-	fmt.Fprintf(w, "# TYPE nebari_landing_jwt_validator_keys gauge\n")
-	fmt.Fprintf(w, "nebari_landing_jwt_validator_keys %d\n", stats.KeyCount)
-	if !stats.LastFetch.IsZero() {
-		fmt.Fprintf(w, "# HELP nebari_landing_jwt_validator_last_fetch_timestamp_seconds Last successful JWKS fetch time.\n")
-		fmt.Fprintf(w, "# TYPE nebari_landing_jwt_validator_last_fetch_timestamp_seconds gauge\n")
-		fmt.Fprintf(w, "nebari_landing_jwt_validator_last_fetch_timestamp_seconds %d\n", stats.LastFetch.Unix())
-	}
-	if !stats.LastRefreshAttempt.IsZero() {
-		fmt.Fprintf(w, "# HELP nebari_landing_jwt_validator_last_refresh_attempt_timestamp_seconds Last attempted JWKS refresh time.\n")
-		fmt.Fprintf(w, "# TYPE nebari_landing_jwt_validator_last_refresh_attempt_timestamp_seconds gauge\n")
-		fmt.Fprintf(w, "nebari_landing_jwt_validator_last_refresh_attempt_timestamp_seconds %d\n", stats.LastRefreshAttempt.Unix())
-	}
-
-	fmt.Fprintf(w, "# HELP nebari_landing_jwks_refresh_attempts_total JWKS refresh attempts.\n")
-	fmt.Fprintf(w, "# TYPE nebari_landing_jwks_refresh_attempts_total counter\n")
-	fmt.Fprintf(w, "nebari_landing_jwks_refresh_attempts_total %d\n", stats.JWKSRefreshAttempts)
-	fmt.Fprintf(w, "# HELP nebari_landing_jwks_refresh_successes_total Successful JWKS refreshes.\n")
-	fmt.Fprintf(w, "# TYPE nebari_landing_jwks_refresh_successes_total counter\n")
-	fmt.Fprintf(w, "nebari_landing_jwks_refresh_successes_total %d\n", stats.JWKSRefreshSuccesses)
-	fmt.Fprintf(w, "# HELP nebari_landing_jwks_refresh_failures_total Failed JWKS refreshes.\n")
-	fmt.Fprintf(w, "# TYPE nebari_landing_jwks_refresh_failures_total counter\n")
-	fmt.Fprintf(w, "nebari_landing_jwks_refresh_failures_total %d\n", stats.JWKSRefreshFailures)
-	fmt.Fprintf(w, "# HELP nebari_landing_jwks_refresh_skipped_total JWKS refreshes skipped by cooldown.\n")
-	fmt.Fprintf(w, "# TYPE nebari_landing_jwks_refresh_skipped_total counter\n")
-	fmt.Fprintf(w, "nebari_landing_jwks_refresh_skipped_total %d\n", stats.JWKSRefreshSkipped)
-	fmt.Fprintf(w, "# HELP nebari_landing_jwks_refresh_coalesced_total JWKS refreshes coalesced while another refresh was running.\n")
-	fmt.Fprintf(w, "# TYPE nebari_landing_jwks_refresh_coalesced_total counter\n")
-	fmt.Fprintf(w, "nebari_landing_jwks_refresh_coalesced_total %d\n", stats.JWKSRefreshCoalesced)
-	fmt.Fprintf(w, "# HELP nebari_landing_unknown_kid_total JWTs that referenced an unknown key ID.\n")
-	fmt.Fprintf(w, "# TYPE nebari_landing_unknown_kid_total counter\n")
-	fmt.Fprintf(w, "nebari_landing_unknown_kid_total %d\n", stats.UnknownKIDTotal)
-	fmt.Fprintf(w, "# HELP nebari_landing_unknown_kid_cache_hits_total Unknown key IDs rejected from the negative cache.\n")
-	fmt.Fprintf(w, "# TYPE nebari_landing_unknown_kid_cache_hits_total counter\n")
-	fmt.Fprintf(w, "nebari_landing_unknown_kid_cache_hits_total %d\n", stats.UnknownKIDCacheHits)
-	fmt.Fprintf(w, "# HELP nebari_landing_unknown_kid_cache_entries Unknown key IDs currently held in the negative cache.\n")
-	fmt.Fprintf(w, "# TYPE nebari_landing_unknown_kid_cache_entries gauge\n")
-	fmt.Fprintf(w, "nebari_landing_unknown_kid_cache_entries %d\n", stats.UnknownKIDCacheEntries)
 }
 
 // extractAndValidateJWT returns the parsed claims for the request, a boolean
@@ -1395,14 +1402,14 @@ func (h *Handler) extractAndValidateJWT(r *http.Request) (*auth.Claims, bool, er
 	if len(authHeader) > maxAuthorizationHeaderBytes {
 		log.Info("Authorization header too large",
 			"bytes", len(authHeader), "maxBytes", maxAuthorizationHeaderBytes, "path", r.URL.Path)
-		return nil, false, fmt.Errorf("Authorization header exceeds maximum size of %d bytes", maxAuthorizationHeaderBytes)
+		return nil, false, fmt.Errorf("authorization header exceeds maximum size of %d bytes", maxAuthorizationHeaderBytes)
 	}
 
 	parts := strings.Split(authHeader, " ")
 	if len(parts) != 2 || parts[0] != "Bearer" {
 		log.Info("Invalid Authorization header format",
 			"scheme", parts[0], "path", r.URL.Path)
-		return nil, false, fmt.Errorf("Authorization header is not in 'Bearer <token>' format")
+		return nil, false, fmt.Errorf("authorization header is not in 'Bearer <token>' format")
 	}
 
 	tokenString := parts[1]
