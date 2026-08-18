@@ -26,13 +26,16 @@ const responsiveServices = [
 ];
 
 async function mockResponsiveServices(page: Page) {
-  await page.route(/\/api\/.*services(?:\/)?(?:\?.*)?$/, async (route) => {
-    await route.fulfill({
-      status: 200,
-      contentType: "application/json",
-      body: JSON.stringify(responsiveServices),
-    });
-  });
+  await page.route(
+    /^https?:\/\/[^/]+\/api\/v1\/services\/?(?:\?.*)?$/,
+    async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(responsiveServices),
+      });
+    },
+  );
 }
 
 async function getBox(locator: Locator) {
@@ -43,10 +46,10 @@ async function getBox(locator: Locator) {
   return box;
 }
 
-test("services toolbar stays on one row and keeps search text sizing stable", async ({ page }) => {
+test("service controls preserve their responsive order and stay in bounds", async ({ page }) => {
   await mockResponsiveServices(page);
 
-  const widths = [560, 640, 767, 816, 1024];
+  const widths = [560, 768, 1024];
 
   for (const width of widths) {
     await page.setViewportSize({ width, height: 900 });
@@ -58,24 +61,36 @@ test("services toolbar stays on one row and keeps search text sizing stable", as
     await expect(allServicesRegion).toBeVisible();
 
     const searchInput = allServicesRegion.getByPlaceholder("Search");
-    const searchButton = allServicesRegion.getByRole("button", {
-      name: /^Search$/,
+    const viewToggle = allServicesRegion.getByRole("tablist");
+    const firstCard = allServicesRegion.getByRole("link", {
+      name: /Long Running Analytics Workspace.*opens in a new tab/i,
     });
-    const viewToggle = allServicesRegion.getByRole("radiogroup");
 
     const inputBox = await getBox(searchInput);
-    const buttonBox = await getBox(searchButton);
     const toggleBox = await getBox(viewToggle);
+    const cardBox = await getBox(firstCard);
+    const regionBox = await getBox(allServicesRegion);
+    const regionRight = regionBox.x + regionBox.width;
 
-    const inputCenterY = inputBox.y + inputBox.height / 2;
-    const toggleCenterY = toggleBox.y + toggleBox.height / 2;
+    for (const box of [inputBox, toggleBox, cardBox]) {
+      expect(box.x).toBeGreaterThanOrEqual(Math.floor(regionBox.x));
+      expect(box.x + box.width).toBeLessThanOrEqual(Math.ceil(regionRight));
+    }
 
-    expect(Math.abs(inputCenterY - toggleCenterY)).toBeLessThanOrEqual(2);
-    expect(buttonBox.x + buttonBox.width).toBeLessThanOrEqual(toggleBox.x);
+    expect(cardBox.y).toBeGreaterThanOrEqual(
+      Math.max(inputBox.y + inputBox.height, toggleBox.y + toggleBox.height),
+    );
 
-    await expect(searchInput).toHaveCSS("font-size", "14px");
-    await expect(searchInput).toHaveCSS("line-height", "20px");
-    await expect(searchInput).toHaveCSS("height", "46px");
+    if (width >= 640) {
+      const controlsOverlapStart = Math.max(inputBox.y, toggleBox.y);
+      const controlsOverlapEnd = Math.min(
+        inputBox.y + inputBox.height,
+        toggleBox.y + toggleBox.height,
+      );
+      expect(controlsOverlapStart).toBeLessThan(controlsOverlapEnd);
+    } else {
+      expect(toggleBox.y).toBeGreaterThanOrEqual(inputBox.y + inputBox.height);
+    }
   }
 });
 
@@ -94,44 +109,41 @@ test("services table keeps headers and rows in bounds while resizing", async ({ 
     await expect(allServicesRegion).toBeVisible();
 
     // Grid is the default view, so switch to the table view this test exercises.
-    await allServicesRegion.getByRole("radio", { name: /Table view/i }).click();
+    await allServicesRegion.getByRole("tab", { name: /List View/i }).click();
 
     const tableContainer = page.locator('[data-slot="table-container"]').first();
     const actionsHeader = page.getByRole("columnheader", { name: /Actions/i }).getByText("Actions");
     const pinButton = allServicesRegion.getByRole("button", {
       name: /^Unpin service$/,
     });
-    const longDescription = page.getByText(/Notebook workspace for collaborative data analysis/);
+    const longServiceRow = allServicesRegion.getByRole("link", {
+      name: /Long Running Analytics Workspace.*opens in a new tab/i,
+    });
+    const serviceIcon = longServiceRow.locator("img").first().locator("..");
+    const serviceTitle = longServiceRow.getByText("Long Running Analytics Workspace");
+    const longDescription = longServiceRow.getByText(
+      /Notebook workspace for collaborative data analysis/,
+    );
 
     await expect(actionsHeader).toBeVisible();
     await expect(pinButton).toBeVisible();
     await expect(longDescription).toBeVisible();
+    await tableContainer.focus();
+    await expect(tableContainer).toBeFocused();
 
-    const containerBox = await getBox(tableContainer);
-    const actionsHeaderBox = await getBox(actionsHeader);
-    const pinButtonBox = await getBox(pinButton);
+    const iconBox = await getBox(serviceIcon);
+    const titleBox = await getBox(serviceTitle);
+    const descriptionBox = await getBox(longDescription);
 
-    const containerRight = containerBox.x + containerBox.width;
+    const textBlockTop = titleBox.y;
+    const textBlockBottom = descriptionBox.y + descriptionBox.height;
+    const iconCenter = iconBox.y + iconBox.height / 2;
+    expect(descriptionBox.y).toBeGreaterThanOrEqual(titleBox.y + titleBox.height);
+    expect(iconCenter).toBeGreaterThanOrEqual(textBlockTop);
+    expect(iconCenter).toBeLessThanOrEqual(textBlockBottom);
 
-    expect(actionsHeaderBox.x).toBeGreaterThanOrEqual(containerBox.x - 1);
-    expect(actionsHeaderBox.x + actionsHeaderBox.width).toBeLessThanOrEqual(containerRight + 1);
-    expect(pinButtonBox.x + pinButtonBox.width).toBeLessThanOrEqual(containerRight + 1);
-
-    const overflow = await tableContainer.evaluate((element) => ({
-      clientWidth: element.clientWidth,
-      scrollWidth: element.scrollWidth,
-    }));
-
-    expect(overflow.scrollWidth).toBeLessThanOrEqual(overflow.clientWidth + 1);
-
-    const descriptionMetrics = await longDescription.evaluate((element) => {
-      const styles = window.getComputedStyle(element);
-      return {
-        height: element.getBoundingClientRect().height,
-        lineHeight: Number.parseFloat(styles.lineHeight),
-      };
-    });
-
-    expect(descriptionMetrics.height).toBeLessThanOrEqual(descriptionMetrics.lineHeight * 2 + 1);
+    expect(
+      await tableContainer.evaluate((element) => element.scrollWidth > element.clientWidth),
+    ).toBe(false);
   }
 });

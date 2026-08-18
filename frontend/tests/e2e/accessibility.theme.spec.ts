@@ -15,16 +15,28 @@ test("dark theme loads correctly and has no detectable accessibility violations"
   // The theme toggle now lives inside the profile menu as a radio group.
   await page.getByRole("button", { name: /account menu/i }).click();
   const darkOption = page.getByRole("menuitemradio", { name: /dark mode/i });
+  const themeGroup = page.getByRole("group", { name: "Theme" });
   await expect(darkOption).toBeVisible();
   await expect(darkOption).toHaveAttribute("aria-checked", "true");
+  await expect(themeGroup).toContainText("Light");
+  await expect(themeGroup).toContainText("Dark");
+  await expect(themeGroup).toContainText("System");
 
-  // The menu fades in (fade-in-0, duration-100). Wait for it to reach full
-  // opacity so axe measures the settled colors rather than the mid-animation
-  // composite, which reports false color-contrast violations.
+  // Let any entrance animation settle so axe evaluates the final rendered state.
   const menuContent = page.locator('[data-slot="dropdown-menu-content"]');
-  await expect(menuContent).toHaveCSS("opacity", "1");
+  await expect(menuContent).toBeVisible();
+  await menuContent.evaluate(async (element) => {
+    await Promise.all(
+      element
+        .getAnimations({ subtree: true })
+        .map((animation) => animation.finished.catch(() => undefined)),
+    );
+  });
 
-  const results = await makeAxeBuilder().analyze();
+  // Base UI injects focus-guard sentinels around portaled popups. They are
+  // implementation-only nodes; keep the open menu in scope while excluding
+  // those sentinels from axe's aria-hidden-focus rule.
+  const results = await makeAxeBuilder().exclude("[data-base-ui-focus-guard]").analyze();
 
   await testInfo.attach("axe-dark-results", {
     body: JSON.stringify(results, null, 2),
