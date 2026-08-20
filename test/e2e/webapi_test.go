@@ -1168,9 +1168,7 @@ var _ = Describe("Webapi – Service Discovery", Ordered, func() {
 			bearerToken = acquireToken(kcTestUser, kcTestPassword)
 
 			By("Port-forwarding to webapi on :18083")
-			pfCmd = exec.Command("kubectl", "port-forward",
-				"-n", namespace, fmt.Sprintf("svc/%s", e2eWebapiService), "18083:8080")
-			Expect(pfCmd.Start()).NotTo(HaveOccurred())
+			pfCmd = startPortForwardAndWait(namespace, fmt.Sprintf("svc/%s", e2eWebapiService), "18083:8080")
 			webapiBase = "http://localhost:18083"
 
 			Eventually(func() error {
