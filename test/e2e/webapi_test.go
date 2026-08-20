@@ -1356,9 +1356,9 @@ var _ = Describe("Webapi – Service Discovery", Ordered, func() {
 			By("Asserting the test-user connection does NOT receive the private added event")
 			// The public probe above proved both clients are reachable; a
 			// genuine filter regression would deliver this frame within the
-			// same window. We give a generous bound (5s) on top of that to
-			// absorb sandbox jitter.
-			Expect(userWS.expectNoNamed(privateAppKey, 5*time.Second)).
+			// same window. Keep this below the JWT session-expiry close window;
+			// by this point a leaked frame would already be queued or in flight.
+			Expect(userWS.expectNoNamed(privateAppKey, 500*time.Millisecond)).
 				To(Succeed(), "test-user (NOT in 'admin') must not receive the private added event")
 		})
 
@@ -1404,7 +1404,7 @@ var _ = Describe("Webapi – Service Discovery", Ordered, func() {
 			By("Asserting admin receives the modified event, test-user does not")
 			Expect(adminWS.waitForNamed(modAppName, "modified", 30*time.Second)).
 				To(Succeed(), "admin must receive the modified event for the private app")
-			Expect(userWS.expectNoNamed(modAppName, 5*time.Second)).
+			Expect(userWS.expectNoNamed(modAppName, 500*time.Millisecond)).
 				To(Succeed(), "test-user must not receive the modified event for the private app")
 		})
 	})
