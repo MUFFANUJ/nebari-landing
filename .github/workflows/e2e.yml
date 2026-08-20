@@ -160,10 +160,11 @@ jobs:
       # The image override below is applied via a Git commit to the local
       # file:// gitops repo ArgoCD reads from, so ArgoCD's auto-sync converges
       # on it as desired state — no cluster-side patch to revert, no need for
-      # an argocd-self-heal toggle. Pinned to @main until v1.1+ is cut.
+      # an argocd-self-heal toggle. Stay on v2 while this workflow relies on
+      # the k3d/existing-cluster platform profile.
       - name: Setup Nebari Sandbox
         id: sandbox
-        uses: nebari-dev/action-nebari-sandbox@09f542cdbcb0ed74307f86fee4f8ad0053a4cd8f # main
+        uses: nebari-dev/action-nebari-sandbox@1369c908d942913f4cda8cb9009e36a355d830e0 # v2.3.0
         with:
           profile: platform
           cluster-name: nebari-e2e
