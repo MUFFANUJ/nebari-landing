@@ -5,7 +5,6 @@ import {
   AccordionItem,
   AccordionTrigger,
 } from "../components/ui/accordion";
-import { cn } from "../lib/cn";
 import { PinnedServicesGrid } from "./PinnedServicesGrid";
 import { ServicesSection } from "./ServicesSection";
 
@@ -21,54 +20,32 @@ export function ServicesAccordion({
   onTogglePin,
 }: ServicesAccordionProps) {
   return (
-    <Accordion
-      type="multiple"
-      defaultValue={["pinned-services", "all-services"]}
-      className="w-full"
-    >
-      <AccordionItem value="pinned-services" className="border-0">
-        <AccordionTrigger
-          className={cn(
-            "relative z-10",
-            "w-fit flex-none",
-            "justify-start gap-3",
-            "rounded-md py-4 pr-0",
-            "transition-none hover:no-underline",
-            "focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50",
-            "[&>svg]:order-first [&>svg]:shrink-0",
-          )}
-        >
-          <div className="text-left">
-            <div className="text-sm font-semibold text-(--text-secondary)">Pinned services</div>
-            <p className="mt-1 text-sm font-normal text-(--text-secondary)">
+    <Accordion multiple defaultValue={["pinned-services", "all-services"]}>
+      <AccordionItem value="pinned-services" className="border-b-0">
+        <AccordionTrigger className="-ml-2 w-fit flex-none justify-start gap-3 hover:no-underline [&>svg]:order-first [&>svg]:shrink-0">
+          <div>
+            <div className="font-semibold text-(--accordion-trigger-foreground)">
+              Pinned services
+            </div>
+            <p className="mt-1 font-normal text-(--accordion-description-foreground)">
               Quick access to your most-used tools
             </p>
           </div>
         </AccordionTrigger>
 
-        <AccordionContent className="pt-2 pb-6">
+        <AccordionContent className="text-foreground" contentClassName="px-0 pt-2 pb-6">
           <PinnedServicesGrid services={pinnedServices} />
         </AccordionContent>
       </AccordionItem>
 
-      <AccordionItem value="all-services" className="border-0">
-        <AccordionTrigger
-          className={cn(
-            "relative z-10",
-            "w-fit flex-none",
-            "justify-start gap-3",
-            "rounded-md py-4 pr-0",
-            "transition-none hover:no-underline",
-            "focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50",
-            "[&>svg]:order-first [&>svg]:shrink-0",
-          )}
-        >
-          <div className="text-left">
-            <div className="text-sm font-semibold text-(--text-secondary)">All services</div>
+      <AccordionItem value="all-services">
+        <AccordionTrigger className="-ml-2 w-fit flex-none justify-start gap-3 hover:no-underline [&>svg]:order-first [&>svg]:shrink-0">
+          <div>
+            <div className="font-semibold text-(--accordion-trigger-foreground)">All services</div>
           </div>
         </AccordionTrigger>
 
-        <AccordionContent className="pt-2 pb-6">
+        <AccordionContent className="text-foreground" contentClassName="px-0 pt-2 pb-6">
           <ServicesSection services={services} onTogglePin={onTogglePin} />
         </AccordionContent>
       </AccordionItem>
