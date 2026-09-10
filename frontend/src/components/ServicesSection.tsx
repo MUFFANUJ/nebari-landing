@@ -2,10 +2,9 @@ import { LayoutGrid, List, Search } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { Service } from "../api/listServices";
 import { Input } from "../components/ui/input";
-import { ToggleGroup, ToggleGroupItem } from "../components/ui/toggle-group";
+import { Tabs, TabsList, TabsPanel, TabsTab } from "../components/ui/tabs";
 import { ServicesGrid } from "./ServicesGrid";
 import { ServicesTable } from "./ServiceTable";
-import { Button } from "./ui/button";
 
 type ServicesSectionProps = {
   services: Service[];
@@ -46,62 +45,55 @@ export function ServicesSection({ services, onTogglePin }: ServicesSectionProps)
   }, [services, query]);
 
   return (
-    <div className="space-y-4">
-      <div className="flex items-center justify-between gap-3 px-1">
-        <div className="flex h-[46px] min-w-[180px] max-w-[262px] flex-1 overflow-visible">
+    <Tabs
+      value={view}
+      onValueChange={(value) => {
+        if (value === "table" || value === "grid") {
+          setView(value);
+        }
+      }}
+    >
+      <div className="grid items-center gap-4 px-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+        <div className="relative min-w-0">
+          <Search
+            aria-hidden="true"
+            className="pointer-events-none absolute top-1/2 left-3 z-10 size-4 -translate-y-1/2 text-muted-foreground"
+          />
           <Input
             ref={inputRef}
             value={query}
             onChange={(event) => setQuery(event.target.value)}
             placeholder="Search"
-            className="h-full rounded-r-none rounded-l-[8px] border border-input border-r-0 px-3 text-sm leading-5 md:text-sm"
+            aria-label="Search services"
+            className="h-[34px] bg-card pl-9"
           />
-
-          <Button
-            type="button"
-            className="h-full w-[49px] rounded-l-none rounded-r-[8px] border border-primary bg-primary px-[13px] py-1 hover:bg-primary/90"
-            aria-label="Search"
-            onClick={() => inputRef.current?.focus()}
-          >
-            <Search className="h-4 w-4" />
-          </Button>
         </div>
 
-        <ToggleGroup
-          type="single"
-          value={view}
-          onValueChange={(value) => {
-            if (value === "table" || value === "grid") {
-              setView(value);
-            }
-          }}
-          className="h-[46px] shrink-0 gap-1 rounded-[8px] border border-border bg-secondary p-1"
-        >
-          <ToggleGroupItem
+        <TabsList className="h-[34px] justify-self-end bg-muted p-1 sm:col-start-2 lg:col-start-3 xl:col-start-4">
+          <TabsTab
             value="grid"
-            aria-label="Grid view"
-            className="h-9 w-9 !rounded-[6px] text-muted-foreground transition-none data-[state=on]:bg-accent data-[state=on]:text-foreground data-[state=on]:shadow-[0px_1px_2px_0px_#0000000D]"
+            className="h-auto gap-1 border-transparent bg-transparent px-1.5 py-0.5 text-muted-foreground-strong data-active:bg-card"
           >
-            <LayoutGrid className="h-4 w-4" />
-          </ToggleGroupItem>
+            <LayoutGrid />
+            <span>Grid View</span>
+          </TabsTab>
 
-          <ToggleGroupItem
+          <TabsTab
             value="table"
-            aria-label="Table view"
-            className="h-9 w-9 !rounded-[6px] text-muted-foreground transition-none data-[state=on]:bg-accent data-[state=on]:text-foreground data-[state=on]:shadow-[0px_1px_2px_0px_#0000000D]"
+            className="h-auto gap-1 border-transparent bg-transparent px-1.5 py-0.5 text-muted-foreground-strong data-active:bg-card"
           >
-            <List className="h-4 w-4" />
-          </ToggleGroupItem>
-        </ToggleGroup>
+            <List />
+            <span>List View</span>
+          </TabsTab>
+        </TabsList>
       </div>
 
-      <div className="px-1">
-        {view === "table" ? (
-          <ServicesTable services={filteredServices} onTogglePin={onTogglePin} />
-        ) : (
-          <ServicesGrid services={filteredServices} onTogglePin={onTogglePin} />
-        )}
-      </div>
-    </div>
+      <TabsPanel value="table" tabIndex={-1} className="px-1">
+        <ServicesTable services={filteredServices} onTogglePin={onTogglePin} />
+      </TabsPanel>
+      <TabsPanel value="grid" tabIndex={-1} className="px-1">
+        <ServicesGrid services={filteredServices} onTogglePin={onTogglePin} />
+      </TabsPanel>
+    </Tabs>
   );
 }
