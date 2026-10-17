@@ -700,8 +700,11 @@ type RequestAccessBody struct {
 }
 
 // handleRequestAccess serves POST /api/v1/services/{id}/request_access.
-// Requires authentication. Returns 202 Accepted on success, 409 Conflict when
-// a pending request or active entitlement already exists, 501 when the access-request store is not configured.
+// Requires authentication. Returns 202 Accepted on success, 403 Forbidden for
+// static services (an approval would make the static card, e.g. the Keycloak
+// admin console gated on /nebari-admins, visible to the requester), 409
+// Conflict when a pending request or active entitlement already exists, 501
+// when the access-request store is not configured.
 //
 //	@Summary		Request access to a private service
 //	@Description	Requires authentication. Creates a pending access request for the caller against the named service; an admin then approves, denies, or revokes via /admin/access-requests. Approval makes only this service visible on the caller's launchpad until expiresAt; it does not change Keycloak groups, so the service itself may still require group membership and refuse the user.
@@ -713,6 +716,7 @@ type RequestAccessBody struct {
 //	@Success		202		{object}	accessrequests.AccessRequest
 //	@Failure		400		{string}	string	"Bad request"
 //	@Failure		401		{string}	string	"Unauthorized"
+//	@Failure		403		{string}	string	"Access to this service is not managed by the landing page"
 //	@Failure		404		{string}	string	"Service not found"
 //	@Failure		405		{string}	string	"Method not allowed"
 //	@Failure		409		{string}	string	"Pending request or active entitlement already exists"
@@ -737,6 +741,15 @@ func (h *Handler) handleRequestAccess(w http.ResponseWriter, r *http.Request, se
 	service := h.cache.Get(serviceID)
 	if service == nil {
 		http.Error(w, "Service not found", http.StatusNotFound)
+		return
+	}
+	// An approval makes the service's card visible on the requester's
+	// launchpad. Static entries do their own auth and are gated by
+	// requiredGroups alone (e.g. the Keycloak admin console behind
+	// /nebari-admins), so an approval must never be able to expose one:
+	// static services never accept requests.
+	if service.Static {
+		http.Error(w, "Access to this service is not managed by the landing page", http.StatusForbidden)
 		return
 	}
 
@@ -1516,17 +1529,18 @@ type PinsResponse struct {
 	// Pins is the ordered list of pinned services (cached ServiceInfo snapshots).
 	Pins []*cache.ServiceInfo `json:"pins"`
 	// UIDs lists exactly which UIDs are stored, including those that are no longer
-	// cached (e.g. the NebariApp was deleted).
+	// cached (e.g. the NebariApp was deleted) or not visible to the caller.
 	UIDs []string `json:"uids"`
 }
 
 // handleGetPins serves GET /api/v1/pins.
 // Requires a valid JWT. Returns the caller's pinned services as full ServiceInfo
 // objects, resolved from the live cache. Pins whose UIDs are no longer in the
-// cache are included in UIDs but absent from Pins (graceful stale handling).
+// cache, or that the caller cannot access, are included in UIDs but absent
+// from Pins.
 //
 //	@Summary		List the caller's pins
-//	@Description	Returns the caller's pinned services. UIDs is the raw stored list; Pins is the subset still resolvable in the live cache (so deleted services are gracefully filtered out).
+//	@Description	Returns the caller's pinned services. UIDs is the raw stored list; Pins is the subset still resolvable in the live cache and visible to the caller (deleted or inaccessible services are filtered out).
 //	@Tags			pins
 //	@Produce		json
 //	@Success		200	{object}	PinsResponse
@@ -1555,9 +1569,14 @@ func (h *Handler) handleGetPins(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
+	// Pinning accepts any UID, so filter on read: a pin must not reveal a
+	// service the caller cannot see in GET /services.
+	// Approved access requests count, so a pinned service the caller reaches
+	// through an approval stays in the list.
+	approvedUIDs := h.callerApprovedServiceUIDs(claims, true)
 	svcs := make([]*cache.ServiceInfo, 0, len(uids))
 	for _, uid := range uids {
-		if svc := h.cache.Get(uid); svc != nil {
+		if svc := h.cache.Get(uid); svc != nil && h.canAccessService(svc, true, claims, approvedUIDs) {
 			svcs = append(svcs, svc)
 		}
 	}
@@ -1569,12 +1588,13 @@ func (h *Handler) handleGetPins(w http.ResponseWriter, r *http.Request) {
 
 // handlePinByUID serves PUT and DELETE /api/v1/pins/{uid}.
 // PUT pins the service; DELETE unpins it. Both are idempotent.
-// The {uid} segment is the NebariApp UID (UIDType string from status.serviceDiscovery).
+// The {uid} segment is the service UID: the NebariApp UID from
+// status.serviceDiscovery, or static-<id> for a static entry.
 //
 //	@Summary		Pin or unpin a service
-//	@Description	PUT pins the service; DELETE unpins. Both operations are idempotent. The UID is the NebariApp UID exposed at status.serviceDiscovery.
+//	@Description	PUT pins the service; DELETE unpins. Both operations are idempotent. The UID is the service UID: the NebariApp UID exposed at status.serviceDiscovery, or static-<id> for a static entry.
 //	@Tags			pins
-//	@Param			uid	path	string	true	"NebariApp UID"
+//	@Param			uid	path	string	true	"Service UID"
 //	@Success		204
 //	@Failure		400	{string}	string	"UID is required"
 //	@Failure		401	{string}	string	"Unauthorized"

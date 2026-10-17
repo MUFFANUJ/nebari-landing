@@ -177,7 +177,7 @@ const docTemplate = `{
                         "uniqueItems": false
                     },
                     "uids": {
-                        "description": "UIDs lists exactly which UIDs are stored, including those that are no longer\ncached (e.g. the NebariApp was deleted).",
+                        "description": "UIDs lists exactly which UIDs are stored, including those that are no longer\ncached (e.g. the NebariApp was deleted) or not visible to the caller.",
                         "items": {
                             "type": "string"
                         },
@@ -1006,7 +1006,7 @@ const docTemplate = `{
         },
         "/pins": {
             "get": {
-                "description": "Returns the caller's pinned services. UIDs is the raw stored list; Pins is the subset still resolvable in the live cache (so deleted services are gracefully filtered out).",
+                "description": "Returns the caller's pinned services. UIDs is the raw stored list; Pins is the subset still resolvable in the live cache and visible to the caller (deleted or inaccessible services are filtered out).",
                 "responses": {
                     "200": {
                         "content": {
@@ -1072,10 +1072,10 @@ const docTemplate = `{
         },
         "/pins/{uid}": {
             "delete": {
-                "description": "PUT pins the service; DELETE unpins. Both operations are idempotent. The UID is the NebariApp UID exposed at status.serviceDiscovery.",
+                "description": "PUT pins the service; DELETE unpins. Both operations are idempotent. The UID is the service UID: the NebariApp UID exposed at status.serviceDiscovery, or static-\u003cid\u003e for a static entry.",
                 "parameters": [
                     {
-                        "description": "NebariApp UID",
+                        "description": "Service UID",
                         "in": "path",
                         "name": "uid",
                         "required": true,
@@ -1150,10 +1150,10 @@ const docTemplate = `{
                 ]
             },
             "put": {
-                "description": "PUT pins the service; DELETE unpins. Both operations are idempotent. The UID is the NebariApp UID exposed at status.serviceDiscovery.",
+                "description": "PUT pins the service; DELETE unpins. Both operations are idempotent. The UID is the service UID: the NebariApp UID exposed at status.serviceDiscovery, or static-\u003cid\u003e for a static entry.",
                 "parameters": [
                     {
-                        "description": "NebariApp UID",
+                        "description": "Service UID",
                         "in": "path",
                         "name": "uid",
                         "required": true,
@@ -1404,6 +1404,16 @@ const docTemplate = `{
                             }
                         },
                         "description": "Unauthorized"
+                    },
+                    "403": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "string"
+                                }
+                            }
+                        },
+                        "description": "Access to this service is not managed by the landing page"
                     },
                     "404": {
                         "content": {

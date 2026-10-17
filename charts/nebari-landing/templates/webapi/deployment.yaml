@@ -76,6 +76,12 @@ spec:
               value: {{ .Values.webapi.accessRequests.approvalTTL | quote }}
             - name: ACCESS_REQUEST_REFRESH_INTERVAL
               value: {{ .Values.webapi.accessRequests.refreshInterval | quote }}
+            {{- with include "nebari-landing.staticServices" . }}
+            # Landing-page entries served without a NebariApp (webapi.staticServices
+            # and webapi.keycloak.landingPage).
+            - name: STATIC_SERVICES
+              value: {{ . | quote }}
+            {{- end }}
             # CORS — comma-separated allowed origins; "*" permits all.
             # The webapi is ClusterIP-only (never exposed by the Gateway); this
             # setting matters only when using a Vite dev server with port-forward.

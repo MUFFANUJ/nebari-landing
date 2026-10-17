@@ -40,6 +40,23 @@ func resolveAccessRequestForTest(t *testing.T, store *accessrequests.Store, id s
 	return updated
 }
 
+// addStaticKeycloak adds the static Keycloak admin-console entry, gated on
+// /nebari-admins, as the chart renders it from webapi.keycloak.landingPage.
+func addStaticKeycloak(sc *cache.ServiceCache) {
+	sc.Add(&sdapp.App{
+		UID:    "static-keycloak",
+		Name:   "keycloak",
+		Static: true,
+		LandingPage: &sdapp.LandingPage{
+			Enabled:        true,
+			DisplayName:    "Keycloak",
+			Visibility:     "private",
+			RequiredGroups: []string{"/nebari-admins"},
+			ExternalURL:    "https://keycloak.example.com/admin/nebari/console/",
+		},
+	})
+}
+
 // newARHandler returns a Handler with auth disabled and an access request store wired in.
 func newARHandler(sc *cache.ServiceCache, store *accessrequests.Store) *Handler {
 	return NewHandler(sc, nil, false, nil, nil, WithAccessRequestStore(store))
@@ -90,6 +107,30 @@ func TestHandleRequestAccess_ServiceNotFound(t *testing.T) {
 	newARHandler(cache.NewServiceCache(), newARStore(t)).Routes().ServeHTTP(rr, req)
 	if rr.Code != http.StatusNotFound {
 		t.Errorf("expected 404, got %d", rr.Code)
+	}
+}
+
+func TestHandleRequestAccess_StaticService_Returns403(t *testing.T) {
+	// Approving a request makes the service visible on the requester's
+	// launchpad, so a static entry (e.g. the Keycloak admin console gated on
+	// /nebari-admins) must never accept one.
+	sc := cache.NewServiceCache()
+	addStaticKeycloak(sc)
+	store := newARStore(t)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/services/static-keycloak/request_access", nil)
+	rr := httptest.NewRecorder()
+	newARHandler(sc, store).Routes().ServeHTTP(rr, req)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d — body: %s", rr.Code, rr.Body.String())
+	}
+
+	all, err := store.ListAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 0 {
+		t.Errorf("expected no access request to be stored, got %d", len(all))
 	}
 }
 
