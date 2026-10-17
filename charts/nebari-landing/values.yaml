@@ -258,16 +258,24 @@ webapi:
     type: ClusterIP
     port: 8080
 
-  # Egress NetworkPolicy for the webapi pod. Enabled by default so the webapi
-  # starts from default-deny egress plus the approved dependencies below.
-  # NebariApp-driven health probes do not use this egress path; they are
-  # delegated to webapi.healthProber so probe targets can be constrained with a
-  # separate NetworkPolicy.
-  # Kubernetes NetworkPolicy cannot portably infer the API server CIDR. Live
-  # Helm installs discover it with lookup(); GitOps/offline renderers must set
-  # kubernetesAPI.cidrs explicitly.
+  # Egress NetworkPolicy for the webapi pod (opt-in). When enabled the webapi
+  # starts from default-deny egress plus the dependencies below.
+  #
+  # Before enabling, set egress.kubernetesAPI.cidrs. The webapi watches
+  # NebariApps and reads the Keycloak admin secret through the Kubernetes API,
+  # and NetworkPolicy cannot select the API server portably. A live
+  # `helm install`/`helm upgrade` can discover the `kubernetes` Service
+  # ClusterIP with lookup(), but `helm template` and GitOps renderers such as
+  # ArgoCD get nothing from lookup(). Rendering fails when the policy is
+  # enabled and neither source yields an API-server address, rather than
+  # shipping a policy that silently cuts the watcher off.
+  #
+  # NebariApp health probes do not use this egress path when
+  # webapi.healthProber.enabled=true (the default); they go through the
+  # prober pod. With the prober disabled the webapi probes targets itself, and
+  # those targets then need additionalRules here.
   networkPolicy:
-    enabled: true
+    enabled: false
     egress:
       # Required for resolving in-cluster Service DNS names.
       dns:
@@ -295,11 +303,21 @@ webapi:
           - 8443
 
       # Required for watching NebariApps. Standard NetworkPolicy cannot select
-      # the kubernetes.default Service directly, so live Helm installs discover
-      # its ClusterIP with lookup(). GitOps/offline renderers should set cidrs
-      # explicitly to the approved API-server Service IP/CIDR.
+      # the kubernetes.default Service directly, so allow the API server by IP.
+      # cidrs is required for helm template / ArgoCD; lookup only works on a
+      # live helm install/upgrade and is ignored when cidrs is set.
+      #
+      # Many CNIs (Calico, Cilium, ...) evaluate egress policy after the
+      # Service DNAT, so the rule must match the API server endpoint addresses
+      # and port, not only the ClusterIP. Include both, e.g. the output of
+      #   kubectl get svc kubernetes -n default -o jsonpath='{.spec.clusterIP}'
+      #   kubectl get endpoints kubernetes -n default
+      # and list the endpoint port in ports (commonly 6443 on kubeadm/k3s, 443
+      # on most managed control planes).
       kubernetesAPI:
-        port: 443
+        ports:
+          - 443
+          - 6443
         lookup:
           enabled: true
           namespace: default

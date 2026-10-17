@@ -45,6 +45,12 @@ EXPECTED_RESOURCES = {
   }
 }.freeze
 
+# NetworkPolicies are opt-in. EXPECT_NETWORK_POLICIES lists the components
+# whose policy the rendered manifests must contain (comma-separated: webapi,
+# health-prober); every other policy must be absent. Empty means the default
+# render, which ships no NetworkPolicy.
+EXPECTED_POLICIES = ENV.fetch("EXPECT_NETWORK_POLICIES", "").split(",").map(&:strip).reject(&:empty?).freeze
+
 EXPECTED_WEBAPI_EGRESS_PORTS = [53, 6379, 8080, 8443, 8081].freeze
 EXPECTED_HEALTH_CHECK_PORTS = [80, 8080].freeze
 DENIED_SAME_NAMESPACE_PORTS = [2379, 2380, 3306, 5432, 6379, 6443, 10250, 10255].freeze
@@ -198,8 +204,10 @@ EXPECTED_RESOURCES.each do |name, expected|
 end
 
 webapi_policy = webapi_egress_policy(manifests)
-if webapi_policy.nil?
-  failures << "Missing default webapi egress NetworkPolicy"
+if !EXPECTED_POLICIES.include?("webapi")
+  failures << "webapi egress NetworkPolicy rendered but was not expected (it must be opt-in)" if webapi_policy
+elsif webapi_policy.nil?
+  failures << "Missing webapi egress NetworkPolicy"
 else
   if hardcodes_default_api_server_cidr?(webapi_policy)
     failures << "webapi egress NetworkPolicy hard-codes the Kubernetes API ClusterIP"
@@ -226,7 +234,7 @@ else
   end
 
   expected_ports = EXPECTED_WEBAPI_EGRESS_PORTS.dup
-  expected_ports << 443 if ENV["EXPECTED_WEBAPI_API_CIDR"]
+  expected_ports << 443 << 6443 if ENV["EXPECTED_WEBAPI_API_CIDR"]
   missing_ports = expected_ports - egress_ports(webapi_policy)
   unless missing_ports.empty?
     failures << "webapi egress NetworkPolicy is missing expected ports #{missing_ports.inspect}"
@@ -239,8 +247,10 @@ else
 end
 
 health_policy = health_prober_policy(manifests)
-if health_policy.nil?
-  failures << "Missing default health-prober NetworkPolicy"
+if !EXPECTED_POLICIES.include?("health-prober")
+  failures << "health-prober NetworkPolicy rendered but was not expected (it must be opt-in)" if health_policy
+elsif health_policy.nil?
+  failures << "Missing health-prober NetworkPolicy"
 else
   if has_sensitive_dependency_egress?(health_policy)
     failures << "health-prober NetworkPolicy allows sensitive webapi dependency egress"
