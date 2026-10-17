@@ -100,7 +100,7 @@ curl -s -X GET http://localhost:8080/api/v1/admin/access-requests \
 
 Revoke an access request entitlement (admin)
 
-Revokes a previously approved landing-owned entitlement. The record is retained for audit, but it no longer grants service access.
+Revokes a previously approved landing-owned entitlement. The record is retained for audit, but it no longer grants service access. Only approved requests can be revoked; any other status returns 409.
 
 ```sh
 curl -s -X DELETE http://localhost:8080/api/v1/admin/access-requests/{id} \
@@ -113,7 +113,7 @@ curl -s -X DELETE http://localhost:8080/api/v1/admin/access-requests/{id} \
 
 Approve, deny, or revoke an access request (admin)
 
-Action is encoded in the URL: PUT .../{id}/approve, .../{id}/deny, or .../{id}/revoke. Approving grants access only to the request's target service inside the landing API until its expiresAt timestamp; it records the human approver and target owner, and never creates or mutates Keycloak groups.
+Action is encoded in the URL: PUT .../{id}/approve, .../{id}/deny, or .../{id}/revoke. Approving grants access only to the request's target service inside the landing API until its expiresAt timestamp; it records the human approver and target owner, and never creates or mutates Keycloak groups. Only pending requests can be approved or denied, and only approved requests can be revoked; any other transition returns 409.
 
 ```sh
 curl -s -X PUT http://localhost:8080/api/v1/admin/access-requests/{id}/{action} \

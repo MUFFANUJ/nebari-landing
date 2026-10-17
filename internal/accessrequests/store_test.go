@@ -211,6 +211,7 @@ func TestListByStatus_FiltersResolvedStatuses(t *testing.T) {
 	revoked, _ := s.Create("svc-2", "mlflow", userA, "", "")
 	resolveForTest(t, s, approved.ID, Resolution{Status: StatusApproved, ResolvedBy: "admin"})
 	resolveForTest(t, s, denied.ID, Resolution{Status: StatusDenied, ResolvedBy: "admin"})
+	resolveForTest(t, s, revoked.ID, Resolution{Status: StatusApproved, ResolvedBy: "admin"})
 	resolveForTest(t, s, revoked.ID, Resolution{Status: StatusRevoked, ResolvedBy: "admin"})
 
 	tests := []struct {
@@ -420,6 +421,135 @@ func TestResolve_NotFound_ReturnsError(t *testing.T) {
 	_, err := s.Resolve("does-not-exist", Resolution{Status: StatusApproved, ResolvedBy: "admin"})
 	if !errors.Is(err, ErrNotFound) {
 		t.Errorf("expected ErrNotFound, got %v", err)
+	}
+}
+
+// --- Resolve: status transitions ---
+
+// moveTo drives a fresh pending request into the given status through legal
+// transitions only.
+func moveTo(t *testing.T, s *Store, status Status) *AccessRequest {
+	t.Helper()
+	req, err := s.Create(svcUID, svcName, userA, "", "")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	expiresAt := time.Now().UTC().Add(time.Hour)
+	switch status {
+	case StatusPending:
+	case StatusApproved:
+		resolveForTest(t, s, req.ID, Resolution{Status: StatusApproved, ExpiresAt: &expiresAt})
+	case StatusDenied:
+		resolveForTest(t, s, req.ID, Resolution{Status: StatusDenied})
+	case StatusRevoked:
+		resolveForTest(t, s, req.ID, Resolution{Status: StatusApproved, ExpiresAt: &expiresAt})
+		resolveForTest(t, s, req.ID, Resolution{Status: StatusRevoked})
+	default:
+		t.Fatalf("moveTo: unsupported status %q", status)
+	}
+	return req
+}
+
+func TestResolve_RejectsIllegalTransitions(t *testing.T) {
+	cases := []struct {
+		from, to Status
+	}{
+		{StatusPending, StatusRevoked},
+		{StatusApproved, StatusApproved},
+		{StatusApproved, StatusDenied},
+		{StatusDenied, StatusApproved},
+		{StatusDenied, StatusDenied},
+		{StatusDenied, StatusRevoked},
+		{StatusRevoked, StatusApproved},
+		{StatusRevoked, StatusDenied},
+		{StatusRevoked, StatusRevoked},
+	}
+	for _, tc := range cases {
+		t.Run(string(tc.from)+"->"+string(tc.to), func(t *testing.T) {
+			s := newStore(t)
+			req := moveTo(t, s, tc.from)
+			before, err := s.Get(req.ID)
+			if err != nil {
+				t.Fatalf("Get: %v", err)
+			}
+			expiresAt := time.Now().UTC().Add(time.Hour)
+			_, err = s.Resolve(req.ID, Resolution{Status: tc.to, ResolvedBy: "late-admin", ExpiresAt: &expiresAt})
+			if !errors.Is(err, ErrInvalidTransition) {
+				t.Fatalf("expected ErrInvalidTransition, got %v", err)
+			}
+			after, err := s.Get(req.ID)
+			if err != nil {
+				t.Fatalf("Get: %v", err)
+			}
+			if after.Status != before.Status || after.ResolvedBy != before.ResolvedBy {
+				t.Fatalf("rejected transition must not write: before %+v, after %+v", before, after)
+			}
+		})
+	}
+}
+
+// TestResolve_StaleActionsCannotDuplicateOrRegrant replays the sequence from
+// review: approve A, revoke A, user files B, an admin acts on the stale A row.
+// The stale deny must not release B's dedup lock, and re-approving A must not
+// bring the revoked entitlement back.
+func TestResolve_StaleActionsCannotDuplicateOrRegrant(t *testing.T) {
+	s := newStore(t)
+	a := moveTo(t, s, StatusRevoked)
+
+	b, err := s.Create(svcUID, svcName, userA, "", "")
+	if err != nil {
+		t.Fatalf("create B: %v", err)
+	}
+	if _, err := s.Resolve(a.ID, Resolution{Status: StatusDenied}); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("deny revoked A: expected ErrInvalidTransition, got %v", err)
+	}
+	if _, err := s.Create(svcUID, svcName, userA, "", ""); !errors.Is(err, ErrDuplicatePending) {
+		t.Fatalf("create C while B is pending: expected ErrDuplicatePending, got %v", err)
+	}
+	expiresAt := time.Now().UTC().Add(time.Hour)
+	if _, err := s.Resolve(a.ID, Resolution{Status: StatusApproved, ExpiresAt: &expiresAt}); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("re-approve revoked A: expected ErrInvalidTransition, got %v", err)
+	}
+	active, err := s.ListActiveServiceUIDs(userA, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("ListActiveServiceUIDs: %v", err)
+	}
+	if len(active) != 0 {
+		t.Fatalf("revoked A must not grant access, got %+v", active)
+	}
+	pending, err := s.ListPending()
+	if err != nil {
+		t.Fatalf("ListPending: %v", err)
+	}
+	if len(pending) != 1 || pending[0].ID != b.ID {
+		t.Fatalf("expected only B pending, got %+v", pending)
+	}
+}
+
+// TestResolve_RevokeExpiredApproval_KeepsNewerDedupLock covers the one legal
+// path where a request leaves a non-pending state while a newer request holds
+// the dedup key: A's active key expires (its row still says approved), the
+// user files B, then an admin revokes A. Revoking A must not release B's lock.
+func TestResolve_RevokeExpiredApproval_KeepsNewerDedupLock(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	s := NewStore(rdb)
+
+	a, err := s.Create(svcUID, svcName, userA, "", "")
+	if err != nil {
+		t.Fatalf("create A: %v", err)
+	}
+	expiresAt := time.Now().UTC().Add(time.Minute)
+	resolveForTest(t, s, a.ID, Resolution{Status: StatusApproved, ExpiresAt: &expiresAt})
+	mr.FastForward(2 * time.Minute)
+
+	if _, err := s.Create(svcUID, svcName, userA, "", ""); err != nil {
+		t.Fatalf("create B after A expired: %v", err)
+	}
+	resolveForTest(t, s, a.ID, Resolution{Status: StatusRevoked})
+	if _, err := s.Create(svcUID, svcName, userA, "", ""); !errors.Is(err, ErrDuplicatePending) {
+		t.Fatalf("create C while B is pending: expected ErrDuplicatePending, got %v", err)
 	}
 }
 

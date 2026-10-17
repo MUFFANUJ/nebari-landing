@@ -260,6 +260,7 @@ func TestHandleAdminListAccessRequests_StatusFiltersResolvedRequests(t *testing.
 	revoked, _ := store.Create("svc-c", "private-c", "carol", "", "")
 	resolveAccessRequestForTest(t, store, approved.ID, accessrequests.Resolution{Status: accessrequests.StatusApproved, ResolvedBy: "admin"})
 	resolveAccessRequestForTest(t, store, denied.ID, accessrequests.Resolution{Status: accessrequests.StatusDenied, ResolvedBy: "admin"})
+	resolveAccessRequestForTest(t, store, revoked.ID, accessrequests.Resolution{Status: accessrequests.StatusApproved, ResolvedBy: "admin"})
 	resolveAccessRequestForTest(t, store, revoked.ID, accessrequests.Resolution{Status: accessrequests.StatusRevoked, ResolvedBy: "admin"})
 
 	h := NewHandler(cache.NewServiceCache(), nil, true, nil, nil,
@@ -517,7 +518,27 @@ func TestExpiredAccessRequestNoLongerGrantsService(t *testing.T) {
 	}
 }
 
-func TestDeniedAccessRequestNoLongerGrantsService(t *testing.T) {
+// adminResolveHandler returns a handler whose caller is an admin, for driving
+// the /admin/access-requests routes.
+func adminResolveHandler(sc *cache.ServiceCache, store *accessrequests.Store) *Handler {
+	return NewHandler(sc, nil, true, nil, nil,
+		WithAccessRequestStore(store),
+		WithClaimsExtractor(func(r *http.Request) (*auth.Claims, bool) {
+			if strings.Contains(r.URL.Path, "/admin/") {
+				return &auth.Claims{
+					Groups:           []string{"admin"},
+					RegisteredClaims: jwt.RegisteredClaims{Subject: "admin-subject"},
+				}, true
+			}
+			return &auth.Claims{
+				PreferredUsername: "alice",
+				RegisteredClaims:  jwt.RegisteredClaims{Subject: "user-subject"},
+			}, true
+		}),
+	)
+}
+
+func TestHandleAdminResolve_IllegalTransitionReturns409(t *testing.T) {
 	sc := cache.NewServiceCache()
 	addPrivateService(sc, "svc-a", "private-a", []string{"team-a"})
 
@@ -526,44 +547,41 @@ func TestDeniedAccessRequestNoLongerGrantsService(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expiresAt := time.Now().UTC().Add(time.Hour)
-	if _, err := store.Resolve(ar.ID, accessrequests.Resolution{
-		Status:     accessrequests.StatusApproved,
-		ResolvedBy: "admin-subject",
-		ExpiresAt:  &expiresAt,
-	}); err != nil {
-		t.Fatal(err)
+	h := adminResolveHandler(sc, store)
+	do := func(method, path string) *httptest.ResponseRecorder {
+		t.Helper()
+		rr := httptest.NewRecorder()
+		h.Routes().ServeHTTP(rr, httptest.NewRequest(method, path, nil))
+		return rr
+	}
+	base := "/api/v1/admin/access-requests/" + ar.ID
+
+	// pending -> revoked is not a transition.
+	if rr := do(http.MethodDelete, base); rr.Code != http.StatusConflict {
+		t.Fatalf("revoke pending: expected 409, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if rr := do(http.MethodPut, base+"/approve"); rr.Code != http.StatusOK {
+		t.Fatalf("approve pending: expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	// An approval is ended by revoking it, not by denying it after the fact.
+	if rr := do(http.MethodPut, base+"/deny"); rr.Code != http.StatusConflict {
+		t.Fatalf("deny approved: expected 409, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if rr := do(http.MethodPut, base+"/revoke"); rr.Code != http.StatusOK {
+		t.Fatalf("revoke approved: expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	// A revoked request is terminal: re-approving it must not re-grant access.
+	if rr := do(http.MethodPut, base+"/approve"); rr.Code != http.StatusConflict {
+		t.Fatalf("re-approve revoked: expected 409, got %d: %s", rr.Code, rr.Body.String())
 	}
 
-	h := NewHandler(sc, nil, true, nil, nil,
-		WithAccessRequestStore(store),
-		WithClaimsExtractor(func(_ *http.Request) (*auth.Claims, bool) {
-			return &auth.Claims{
-				PreferredUsername: "alice",
-				RegisteredClaims:  jwt.RegisteredClaims{Subject: "user-subject"},
-			}, true
-		}),
-	)
 	rr := doGet(t, h.Routes(), "/api/v1/services")
 	var resp ServiceResponse
 	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
 		t.Fatal(err)
 	}
-	if len(resp.Services) != 1 {
-		t.Fatalf("expected approved service before denial, got %+v", resp.Services)
-	}
-
-	resolveAccessRequestForTest(t, store, ar.ID, accessrequests.Resolution{
-		Status:     accessrequests.StatusDenied,
-		ResolvedBy: "admin-subject",
-	})
-	rr = doGet(t, h.Routes(), "/api/v1/services")
-	resp = ServiceResponse{}
-	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
-		t.Fatal(err)
-	}
 	if len(resp.Services) != 0 {
-		t.Fatalf("expected denied request to remove access, got %+v", resp.Services)
+		t.Fatalf("expected no access after revoke + rejected re-approve, got %+v", resp.Services)
 	}
 }
 

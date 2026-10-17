@@ -1047,7 +1047,7 @@ func (h *Handler) handleAdminAccessRequestSub(w http.ResponseWriter, r *http.Req
 // handleAdminResolveAccessRequest serves PUT /api/v1/admin/access-requests/{id}/{action}.
 //
 //	@Summary		Approve, deny, or revoke an access request (admin)
-//	@Description	Action is encoded in the URL: PUT .../{id}/approve, .../{id}/deny, or .../{id}/revoke. Approving grants access only to the request's target service inside the landing API until its expiresAt timestamp; it records the human approver and target owner, and never creates or mutates Keycloak groups.
+//	@Description	Action is encoded in the URL: PUT .../{id}/approve, .../{id}/deny, or .../{id}/revoke. Approving grants access only to the request's target service inside the landing API until its expiresAt timestamp; it records the human approver and target owner, and never creates or mutates Keycloak groups. Only pending requests can be approved or denied, and only approved requests can be revoked; any other transition returns 409.
 //	@Tags			admin
 //	@Produce		json
 //	@Param			id		path		string	true	"Access request ID"
@@ -1058,6 +1058,7 @@ func (h *Handler) handleAdminAccessRequestSub(w http.ResponseWriter, r *http.Req
 //	@Failure		403		{string}	string	"Forbidden: admin group required"
 //	@Failure		404		{string}	string	"Request not found"
 //	@Failure		405		{string}	string	"Method not allowed"
+//	@Failure		409		{string}	string	"Invalid status transition"
 //	@Failure		501		{string}	string	"Access request feature not configured"
 //	@Security		BearerAuth
 //	@Router			/admin/access-requests/{id}/{action} [put]
@@ -1090,7 +1091,7 @@ func (h *Handler) handleAdminResolveAccessRequest(w http.ResponseWriter, r *http
 // handleAdminDeleteAccessRequest serves DELETE /api/v1/admin/access-requests/{id}.
 //
 //	@Summary		Revoke an access request entitlement (admin)
-//	@Description	Revokes a previously approved landing-owned entitlement. The record is retained for audit, but it no longer grants service access.
+//	@Description	Revokes a previously approved landing-owned entitlement. The record is retained for audit, but it no longer grants service access. Only approved requests can be revoked; any other status returns 409.
 //	@Tags			admin
 //	@Produce		json
 //	@Param			id	path		string	true	"Access request ID"
@@ -1100,6 +1101,7 @@ func (h *Handler) handleAdminResolveAccessRequest(w http.ResponseWriter, r *http
 //	@Failure		403	{string}	string	"Forbidden: admin group required"
 //	@Failure		404	{string}	string	"Request not found"
 //	@Failure		405	{string}	string	"Method not allowed"
+//	@Failure		409	{string}	string	"Invalid status transition"
 //	@Failure		501	{string}	string	"Access request feature not configured"
 //	@Security		BearerAuth
 //	@Router			/admin/access-requests/{id} [delete]
@@ -1125,6 +1127,10 @@ func (h *Handler) writeAccessRequestResolution(w http.ResponseWriter, id string,
 		}
 		if errors.Is(err, accessrequests.ErrInvalidStatus) {
 			http.Error(w, "Bad request", http.StatusBadRequest)
+			return
+		}
+		if errors.Is(err, accessrequests.ErrInvalidTransition) {
+			http.Error(w, "Access request cannot change from its current status: only pending requests can be approved or denied, and only approved requests can be revoked", http.StatusConflict)
 			return
 		}
 		log.Error(err, "Failed to update access request", "id", id, "status", status)

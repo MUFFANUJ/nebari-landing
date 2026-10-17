@@ -464,7 +464,7 @@ const docTemplate = `{
         },
         "/admin/access-requests/{id}": {
             "delete": {
-                "description": "Revokes a previously approved landing-owned entitlement. The record is retained for audit, but it no longer grants service access.",
+                "description": "Revokes a previously approved landing-owned entitlement. The record is retained for audit, but it no longer grants service access. Only approved requests can be revoked; any other status returns 409.",
                 "parameters": [
                     {
                         "description": "Access request ID",
@@ -537,6 +537,16 @@ const docTemplate = `{
                         },
                         "description": "Method not allowed"
                     },
+                    "409": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "string"
+                                }
+                            }
+                        },
+                        "description": "Invalid status transition"
+                    },
                     "501": {
                         "content": {
                             "application/json": {
@@ -561,7 +571,7 @@ const docTemplate = `{
         },
         "/admin/access-requests/{id}/{action}": {
             "put": {
-                "description": "Action is encoded in the URL: PUT .../{id}/approve, .../{id}/deny, or .../{id}/revoke. Approving grants access only to the request's target service inside the landing API until its expiresAt timestamp; it records the human approver and target owner, and never creates or mutates Keycloak groups.",
+                "description": "Action is encoded in the URL: PUT .../{id}/approve, .../{id}/deny, or .../{id}/revoke. Approving grants access only to the request's target service inside the landing API until its expiresAt timestamp; it records the human approver and target owner, and never creates or mutates Keycloak groups. Only pending requests can be approved or denied, and only approved requests can be revoked; any other transition returns 409.",
                 "parameters": [
                     {
                         "description": "Access request ID",
@@ -642,6 +652,16 @@ const docTemplate = `{
                             }
                         },
                         "description": "Method not allowed"
+                    },
+                    "409": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "string"
+                                }
+                            }
+                        },
+                        "description": "Invalid status transition"
                     },
                     "501": {
                         "content": {

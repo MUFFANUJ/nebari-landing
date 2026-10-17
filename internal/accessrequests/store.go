@@ -41,7 +41,10 @@ const (
 	arActivePrefix = "nebari:ar:active:"
 )
 
-const deleteActiveIfMatchesScript = `
+// deleteIfMatchesScript deletes KEYS[1] only when it still holds ARGV[1]. It
+// is used for the active and dedup keys so an old request can never clear a
+// key that a newer request for the same user/service now owns.
+const deleteIfMatchesScript = `
 if redis.call("GET", KEYS[1]) == ARGV[1] then
 	return redis.call("DEL", KEYS[1])
 end
@@ -118,6 +121,11 @@ var (
 
 	// ErrInvalidStatus is returned when a resolution status is unsupported.
 	ErrInvalidStatus = errors.New("invalid access request status")
+
+	// ErrInvalidTransition is returned by Resolve when the request's current
+	// status does not allow the requested change. Only pending->approved,
+	// pending->denied, and approved->revoked are allowed.
+	ErrInvalidTransition = errors.New("access request status transition not allowed")
 )
 
 // Store is a Redis-backed persistent store for AccessRequest records.
@@ -334,74 +342,119 @@ func (s *Store) listFromIndex(indexKey string) ([]*AccessRequest, error) {
 	return out, nil
 }
 
+// resolveMaxAttempts bounds the optimistic-lock retries in Resolve. A retry
+// only happens when another writer touched the same record between our read
+// and our EXEC, so a handful of attempts is plenty.
+const resolveMaxAttempts = 3
+
+// allowedTransition reports whether an access request may move from one
+// status to another. Pending requests are decided once (approve or deny);
+// an approval can later be revoked. Everything else is terminal, so a stale
+// admin action cannot resurrect a denied, revoked, or superseded request.
+func allowedTransition(from, to Status) bool {
+	switch from {
+	case StatusPending:
+		return to == StatusApproved || to == StatusDenied
+	case StatusApproved:
+		return to == StatusRevoked
+	default:
+		return false
+	}
+}
+
 // Resolve transitions an access request to Approved, Denied, or Revoked and
 // records who performed the resolution. Returns the updated request.
+//
+// Only pending->approved, pending->denied, and approved->revoked are allowed;
+// any other transition returns ErrInvalidTransition without writing. The
+// status check and the write run in one WATCH/MULTI transaction so two admins
+// acting on the same request cannot both succeed.
+//
 // Returns ErrNotFound when the ID does not exist.
 func (s *Store) Resolve(id string, resolution Resolution) (*AccessRequest, error) {
 	if resolution.Status != StatusApproved && resolution.Status != StatusDenied && resolution.Status != StatusRevoked {
 		return nil, ErrInvalidStatus
 	}
 	ctx := context.Background()
-	// Fetch the full record so we can clean up the dedup key.
-	fields, err := s.rdb.HGetAll(ctx, arKey(id)).Result()
-	if err != nil {
-		return nil, fmt.Errorf("accessrequests.Resolve get: %w", err)
-	}
-	if len(fields) == 0 {
-		return nil, ErrNotFound
-	}
-	req, err := arFromHash(fields)
-	if err != nil {
-		return nil, err
-	}
-	now := time.Now().UTC()
-	req.Status = resolution.Status
-	req.ResolvedAt = &now
-	req.ResolvedBy = resolution.ResolvedBy
-	req.ResolvedByName = resolution.ResolvedByName
-	req.ResolvedByEmail = resolution.ResolvedByEmail
-	req.ExpiresAt = nil
-	if resolution.Status == StatusApproved && resolution.ExpiresAt != nil {
-		exp := resolution.ExpiresAt.UTC()
-		req.ExpiresAt = &exp
-	}
-	resolvedAtStr := now.Format(time.RFC3339Nano)
-	activeKey := arActiveKey(req.UserID, req.ServiceUID)
-	_, err = s.rdb.Pipelined(ctx, func(pipe redis.Pipeliner) error {
-		pipe.HSet(ctx, arKey(id),
-			"status", string(resolution.Status),
-			"resolvedAt", resolvedAtStr,
-			"resolvedBy", resolution.ResolvedBy,
-			"resolvedByName", resolution.ResolvedByName,
-			"resolvedByEmail", resolution.ResolvedByEmail,
-		)
-		if req.ExpiresAt != nil {
-			pipe.HSet(ctx, arKey(id), "expiresAt", req.ExpiresAt.Format(time.RFC3339Nano))
-		} else {
-			pipe.HDel(ctx, arKey(id), "expiresAt")
+	key := arKey(id)
+	var req *AccessRequest
+	txf := func(tx *redis.Tx) error {
+		fields, err := tx.HGetAll(ctx, key).Result()
+		if err != nil {
+			return fmt.Errorf("accessrequests.Resolve get: %w", err)
 		}
-		if req.Status == StatusApproved && req.ExpiresAt != nil {
-			if ttl := req.ExpiresAt.Sub(now); ttl > 0 {
-				pipe.Set(ctx, activeKey, req.ID, ttl)
+		if len(fields) == 0 {
+			return ErrNotFound
+		}
+		req, err = arFromHash(fields)
+		if err != nil {
+			return err
+		}
+		if !allowedTransition(req.Status, resolution.Status) {
+			return fmt.Errorf("%w: %s -> %s", ErrInvalidTransition, req.Status, resolution.Status)
+		}
+		now := time.Now().UTC()
+		req.Status = resolution.Status
+		req.ResolvedAt = &now
+		req.ResolvedBy = resolution.ResolvedBy
+		req.ResolvedByName = resolution.ResolvedByName
+		req.ResolvedByEmail = resolution.ResolvedByEmail
+		req.ExpiresAt = nil
+		if resolution.Status == StatusApproved && resolution.ExpiresAt != nil {
+			exp := resolution.ExpiresAt.UTC()
+			req.ExpiresAt = &exp
+		}
+		resolvedAtStr := now.Format(time.RFC3339Nano)
+		activeKey := arActiveKey(req.UserID, req.ServiceUID)
+		_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+			pipe.HSet(ctx, key,
+				"status", string(resolution.Status),
+				"resolvedAt", resolvedAtStr,
+				"resolvedBy", resolution.ResolvedBy,
+				"resolvedByName", resolution.ResolvedByName,
+				"resolvedByEmail", resolution.ResolvedByEmail,
+			)
+			if req.ExpiresAt != nil {
+				pipe.HSet(ctx, key, "expiresAt", req.ExpiresAt.Format(time.RFC3339Nano))
 			} else {
-				pipe.Eval(ctx, deleteActiveIfMatchesScript, []string{activeKey}, req.ID)
+				pipe.HDel(ctx, key, "expiresAt")
 			}
-		} else {
-			// Resolving to denied/revoked clears this request's entitlement for
-			// the user/service pair. The compare prevents an old request from
-			// deleting a newer active approval for the same target.
-			pipe.Eval(ctx, deleteActiveIfMatchesScript, []string{activeKey}, req.ID)
+			if req.Status == StatusApproved && req.ExpiresAt != nil {
+				if ttl := req.ExpiresAt.Sub(now); ttl > 0 {
+					pipe.Set(ctx, activeKey, req.ID, ttl)
+				} else {
+					pipe.Eval(ctx, deleteIfMatchesScript, []string{activeKey}, req.ID)
+				}
+			} else {
+				// Resolving to denied/revoked clears this request's entitlement for
+				// the user/service pair. The compare prevents an old request from
+				// deleting a newer active approval for the same target.
+				pipe.Eval(ctx, deleteIfMatchesScript, []string{activeKey}, req.ID)
+			}
+			// Remove from pending index; keep in all + user indexes.
+			pipe.ZRem(ctx, arPendingKey, id)
+			// Release the dedup lock so a future request can be created, but only
+			// if it is still ours: once this request left pending, the key may
+			// already belong to a newer pending request for the same pair.
+			pipe.Eval(ctx, deleteIfMatchesScript, []string{arDedupKey(req.UserID, req.ServiceUID)}, req.ID)
+			return nil
+		})
+		if err != nil {
+			return fmt.Errorf("accessrequests.Resolve write: %w", err)
 		}
-		// Remove from pending index; keep in all + user indexes.
-		pipe.ZRem(ctx, arPendingKey, id)
-		// Release the dedup lock so a future request can be created.
-		pipe.Del(ctx, arDedupKey(req.UserID, req.ServiceUID))
 		return nil
-	})
-	if err != nil {
-		return nil, fmt.Errorf("accessrequests.Resolve write: %w", err)
 	}
-	return req, nil
+
+	for attempt := 0; attempt < resolveMaxAttempts; attempt++ {
+		err := s.rdb.Watch(ctx, txf, key)
+		if err == nil {
+			return req, nil
+		}
+		if !errors.Is(err, redis.TxFailedErr) {
+			return nil, err
+		}
+	}
+	return nil, fmt.Errorf("accessrequests.Resolve: %w", redis.TxFailedErr)
 }
 
 // ActiveApproved reports whether this record currently grants service access.
