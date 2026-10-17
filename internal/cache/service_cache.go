@@ -8,8 +8,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-logr/logr"
 	sdapp "github.com/nebari-dev/nebari-landing/internal/app"
 	"k8s.io/apimachinery/pkg/util/validation"
+	ctrl "sigs.k8s.io/controller-runtime"
 )
 
 const (
@@ -46,22 +48,12 @@ var protectedHealthCheckNamespaces = map[string]struct{}{
 	"vault":                {},
 }
 
-var protectedHealthCheckServiceTokens = map[string]struct{}{
-	"coredns":    {},
-	"dns":        {},
-	"etcd":       {},
-	"keycloak":   {},
-	"kube":       {},
-	"kubernetes": {},
-	"mariadb":    {},
-	"metadata":   {},
-	"mongo":      {},
-	"mongodb":    {},
-	"mysql":      {},
-	"postgres":   {},
-	"postgresql": {},
-	"redis":      {},
-	"vault":      {},
+// protectedHealthCheckServices lists individual Services, as
+// "namespace/name", that are protected outside the protected namespaces. The
+// API server's Service lives in "default", which cannot be protected as a
+// whole.
+var protectedHealthCheckServices = map[string]struct{}{
+	"default/kubernetes": {},
 }
 
 var protectedHealthCheckPorts = map[int]struct{}{
@@ -134,12 +126,19 @@ type HealthStatus struct {
 type ServiceCache struct {
 	mu       sync.RWMutex
 	services map[string]*ServiceInfo // keyed by UID
+	// healthCheckDropReasons remembers, per UID, why a requested health check
+	// was dropped, so the reason is logged once per change rather than on
+	// every watcher update.
+	healthCheckDropReasons map[string]string
+	log                    logr.Logger
 }
 
 // NewServiceCache creates a new service cache
 func NewServiceCache() *ServiceCache {
 	return &ServiceCache{
-		services: make(map[string]*ServiceInfo),
+		services:               make(map[string]*ServiceInfo),
+		healthCheckDropReasons: make(map[string]string),
+		log:                    ctrl.Log.WithName("service-cache"),
 	}
 }
 
@@ -163,10 +162,12 @@ func (c *ServiceCache) Add(a *sdapp.App) {
 	if lp.Visibility != "" {
 		visibility = lp.Visibility
 	}
-	healthCheckConfig := buildHealthCheckConfig(a)
+	healthCheckConfig, dropReason := buildHealthCheckConfig(a)
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	c.recordHealthCheckDrop(a, dropReason)
 
 	health := c.preserveHealthStatus(a.UID)
 	if c.shouldResetHealthStatus(a.UID, healthCheckConfig) {
@@ -199,6 +200,24 @@ func (c *ServiceCache) Remove(uid string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.services, uid)
+	delete(c.healthCheckDropReasons, uid)
+}
+
+// recordHealthCheckDrop logs why a requested health check was dropped, once
+// per change of reason. The caller must hold c.mu for writing.
+func (c *ServiceCache) recordHealthCheckDrop(a *sdapp.App, reason string) {
+	previous := c.healthCheckDropReasons[a.UID]
+	if reason == previous {
+		return
+	}
+	if reason == "" {
+		delete(c.healthCheckDropReasons, a.UID)
+		c.log.Info("Health check enabled again", "uid", a.UID, "namespace", a.Namespace, "name", a.Name)
+		return
+	}
+	c.healthCheckDropReasons[a.UID] = reason
+	c.log.Info("Health check disabled; the card will show health as unknown",
+		"uid", a.UID, "namespace", a.Namespace, "name", a.Name, "reason", reason)
 }
 
 // Get retrieves a service by UID
@@ -336,16 +355,21 @@ func buildURL(a *sdapp.App) string {
 }
 
 // buildHealthCheckConfig constructs a HealthCheckConfig from the app's
-// health check settings. Returns nil when health checking is disabled or
-// not configured.
-func buildHealthCheckConfig(a *sdapp.App) *HealthCheckConfig {
+// health check settings. It returns a nil config and an empty reason when
+// health checking is disabled or not configured, and a nil config with the
+// reason when a requested check is dropped because its target is not allowed.
+//
+// The checks here apply to NebariApp-sourced input, which any author who can
+// create a NebariApp controls. Operator-configured health checks (chart
+// values) are trusted and should not be routed through this function.
+func buildHealthCheckConfig(a *sdapp.App) (*HealthCheckConfig, string) {
 	if a.LandingPage == nil || a.LandingPage.HealthCheck == nil || !a.LandingPage.HealthCheck.Enabled {
-		return nil
+		return nil, ""
 	}
 	hc := a.LandingPage.HealthCheck
 	path, ok := normalizeHealthCheckPath(hc.Path)
 	if !ok {
-		return nil
+		return nil, fmt.Sprintf("healthCheck.path %q is not a valid absolute request path", hc.Path)
 	}
 
 	interval := clampHealthCheckSeconds(
@@ -372,20 +396,21 @@ func buildHealthCheckConfig(a *sdapp.App) *HealthCheckConfig {
 		serviceName = a.Name
 	}
 	if len(validation.IsDNS1035Label(serviceName)) != 0 {
-		return nil
+		return nil, fmt.Sprintf("service name %q is not a valid DNS-1035 label", serviceName)
 	}
-	servicePort := a.ServicePort
-	if servicePort == 0 {
-		servicePort = 80
+	port := a.ServicePort
+	if port == 0 {
+		port = 80
 	}
-	// healthCheck.port is not allowed to widen the target beyond the declared
-	// backend Service port; otherwise a NebariApp author could probe arbitrary
-	// ports on an otherwise legitimate Service.
-	if hc.Port > 0 && hc.Port != servicePort {
-		return nil
+	// healthCheck.port overrides the Service port, as the NebariApp CRD
+	// documents, for backends that serve health on a separate management port
+	// (e.g. Keycloak X serves /health/ready on 9000, not 8080). The target is
+	// still the declared Service; protected ports are rejected below.
+	if hc.Port > 0 {
+		port = hc.Port
 	}
-	if servicePort < 1 || servicePort > 65535 {
-		return nil
+	if port < 1 || port > 65535 {
+		return nil, fmt.Sprintf("health check port %d is outside 1-65535", port)
 	}
 	// Use ServiceNamespace (spec.service.namespace) only after enforcing the
 	// cross-namespace consent decision made by the watcher.
@@ -394,19 +419,21 @@ func buildHealthCheckConfig(a *sdapp.App) *HealthCheckConfig {
 		serviceNamespace = a.Namespace
 	}
 	if len(validation.IsDNS1123Label(serviceNamespace)) != 0 {
-		return nil
+		return nil, fmt.Sprintf("service namespace %q is not a valid DNS-1123 label", serviceNamespace)
 	}
 	if serviceNamespace != a.Namespace && !a.HealthCheckCrossNamespaceAllowed {
-		return nil
+		return nil, fmt.Sprintf(
+			"target Service %s/%s is in another namespace and no ReferenceGrant in %q permits NebariApps from %q to reference it",
+			serviceNamespace, serviceName, serviceNamespace, a.Namespace)
 	}
-	if HealthCheckTargetProtected(serviceNamespace, serviceName, servicePort) {
-		return nil
+	if reason := HealthCheckTargetProtection(serviceNamespace, serviceName, port); reason != "" {
+		return nil, fmt.Sprintf("target %s.%s:%d is protected: %s", serviceName, serviceNamespace, port, reason)
 	}
 	return &HealthCheckConfig{
-		ProbeURL:        fmt.Sprintf("http://%s.%s:%d%s", serviceName, serviceNamespace, servicePort, path),
+		ProbeURL:        fmt.Sprintf("http://%s.%s:%d%s", serviceName, serviceNamespace, port, path),
 		IntervalSeconds: interval,
 		TimeoutSeconds:  timeout,
-	}
+	}, ""
 }
 
 func normalizeHealthCheckPath(path string) (string, bool) {
@@ -451,19 +478,28 @@ func clampHealthCheckSeconds(value, defaultValue, minValue, maxValue int) int {
 // namespace/service/port class that must not be reachable from NebariApp-owned
 // health checks.
 func HealthCheckTargetProtected(namespace, serviceName string, port int) bool {
+	return HealthCheckTargetProtection(namespace, serviceName, port) != ""
+}
+
+// HealthCheckTargetProtection returns why a health probe target is protected,
+// or "" when it is not. Protection is by namespace (identity, GitOps,
+// control-plane, and database namespaces, plus any "*-system" namespace), by
+// explicitly listed Service, and by well-known non-HTTP infrastructure port.
+// Service names are not pattern-matched: a token heuristic (any name
+// containing "kube", "dns", "redis", ...) dropped legitimate checks such as
+// kube-prometheus-stack-grafana.
+func HealthCheckTargetProtection(namespace, serviceName string, port int) string {
 	if _, ok := protectedHealthCheckNamespaces[namespace]; ok {
-		return true
+		return fmt.Sprintf("namespace %q is protected", namespace)
 	}
 	if strings.HasSuffix(namespace, "-system") {
-		return true
+		return fmt.Sprintf("namespace %q is a system namespace", namespace)
+	}
+	if _, ok := protectedHealthCheckServices[namespace+"/"+serviceName]; ok {
+		return fmt.Sprintf("Service %s/%s is protected", namespace, serviceName)
 	}
 	if _, ok := protectedHealthCheckPorts[port]; ok {
-		return true
+		return fmt.Sprintf("port %d is protected", port)
 	}
-	for _, token := range strings.Split(serviceName, "-") {
-		if _, ok := protectedHealthCheckServiceTokens[token]; ok {
-			return true
-		}
-	}
-	return false
+	return ""
 }

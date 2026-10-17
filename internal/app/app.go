@@ -115,9 +115,10 @@ type HealthCheck struct {
 	// Defaults to 5 when not set.
 	TimeoutSeconds int
 
-	// Port mirrors spec.landingPage.healthCheck.port when present. It is
-	// accepted only when it matches spec.service.port; otherwise the health check
-	// is disabled so app authors cannot widen probes to arbitrary ports.
-	// When 0, spec.service.port is used.
+	// Port overrides the service port for the health probe. Useful when the
+	// target exposes health endpoints on a separate management port (e.g.
+	// Keycloak X exposes /health/ready on port 9000, not the main 8080).
+	// The probe still targets the declared Service; protected ports are
+	// rejected. When 0, spec.service.port is used.
 	Port int
 }

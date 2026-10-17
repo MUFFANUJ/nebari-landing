@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr/funcr"
 	sdapp "github.com/nebari-dev/nebari-landing/internal/app"
 )
 
@@ -522,16 +523,18 @@ func TestBuildHealthCheckConfig_RejectsProtectedTargets(t *testing.T) {
 			crossNamespaceOK: true,
 		},
 		{
-			name:        "database service name",
-			namespace:   "team-a",
-			serviceName: "nebari-redis-master",
-			servicePort: 8080,
+			name:             "API server Service",
+			namespace:        "default",
+			serviceName:      "kubernetes",
+			servicePort:      443,
+			crossNamespaceOK: true,
 		},
 		{
-			name:        "control-plane service name",
-			namespace:   "team-a",
-			serviceName: "kubernetes",
-			servicePort: 8080,
+			name:             "system namespace suffix",
+			namespace:        "longhorn-system",
+			serviceName:      "longhorn-frontend",
+			servicePort:      80,
+			crossNamespaceOK: true,
 		},
 		{
 			name:        "database port",
@@ -567,27 +570,171 @@ func TestBuildHealthCheckConfig_RejectsProtectedTargets(t *testing.T) {
 	}
 }
 
-func TestBuildHealthCheckConfig_RejectsHealthCheckPortOverride(t *testing.T) {
-	c := NewServiceCache()
-	a := makeApp("uid-port-override", "app", "team-a", "app.example.com", &sdapp.LandingPage{
+// healthCheckApp returns a same-namespace app with an enabled health check on
+// the given backend Service.
+func healthCheckApp(uid, serviceName string, servicePort, healthPort int) *sdapp.App {
+	a := makeApp(uid, "app", "team-a", "app.example.com", &sdapp.LandingPage{
 		Enabled: true,
 		HealthCheck: &sdapp.HealthCheck{
 			Enabled: true,
 			Path:    "/ready",
-			Port:    9000,
+			Port:    healthPort,
 		},
 	})
-	a.ServiceName = "app-backend"
-	a.ServicePort = 8080
+	a.ServiceName = serviceName
+	a.ServicePort = servicePort
+	return a
+}
 
-	c.Add(a)
+// The NebariApp CRD documents healthCheck.port as overriding the service port
+// (e.g. Keycloak X's management port 9000), so it must keep working.
+func TestBuildHealthCheckConfig_HonoursHealthCheckPortOverride(t *testing.T) {
+	c := NewServiceCache()
+	c.Add(healthCheckApp("uid-port-override", "app-backend", 8080, 9000))
 
 	svc := c.Get("uid-port-override")
-	if svc == nil {
-		t.Fatal("expected service in cache")
+	if svc == nil || svc.HealthCheckConfig == nil {
+		t.Fatalf("expected health check config, got %+v", svc)
 	}
-	if svc.HealthCheckConfig != nil {
-		t.Fatalf("expected healthCheck.port override to disable health check, got %+v", svc.HealthCheckConfig)
+	if got, want := svc.HealthCheckConfig.ProbeURL, "http://app-backend.team-a:9000/ready"; got != want {
+		t.Errorf("ProbeURL = %q, want %q", got, want)
+	}
+}
+
+func TestBuildHealthCheckConfig_RejectsProtectedHealthCheckPortOverride(t *testing.T) {
+	cfg, reason := buildHealthCheckConfig(healthCheckApp("uid-port-protected", "app-backend", 8080, 5432))
+	if cfg != nil {
+		t.Fatalf("expected protected healthCheck.port to disable health check, got %+v", cfg)
+	}
+	if !strings.Contains(reason, "port 5432 is protected") {
+		t.Errorf("reason = %q, want it to name the protected port", reason)
+	}
+}
+
+// Service names are not pattern-matched: names that merely contain tokens
+// such as "kube", "dns", "redis" or "keycloak" are ordinary pack backends.
+func TestBuildHealthCheckConfig_AllowsServiceNamesWithInfrastructureTokens(t *testing.T) {
+	for _, serviceName := range []string{
+		"kube-prometheus-stack-grafana",
+		"external-dns-ui",
+		"redis-insight",
+		"keycloak-theme-preview",
+		"metadata-api",
+	} {
+		t.Run(serviceName, func(t *testing.T) {
+			cfg, reason := buildHealthCheckConfig(healthCheckApp("uid-"+serviceName, serviceName, 80, 0))
+			if cfg == nil {
+				t.Fatalf("expected health check config, dropped: %s", reason)
+			}
+		})
+	}
+}
+
+func TestBuildHealthCheckConfig_ReturnsDropReason(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		app  func() *sdapp.App
+		want string
+	}{
+		{
+			name: "invalid path",
+			app: func() *sdapp.App {
+				a := healthCheckApp("uid", "app-backend", 8080, 0)
+				a.LandingPage.HealthCheck.Path = "relative"
+				return a
+			},
+			want: "healthCheck.path",
+		},
+		{
+			name: "invalid service name",
+			app:  func() *sdapp.App { return healthCheckApp("uid", "bad_name", 8080, 0) },
+			want: "not a valid DNS-1035 label",
+		},
+		{
+			name: "port out of range",
+			app:  func() *sdapp.App { return healthCheckApp("uid", "app-backend", 8080, 70000) },
+			want: "outside 1-65535",
+		},
+		{
+			name: "invalid namespace",
+			app: func() *sdapp.App {
+				a := healthCheckApp("uid", "app-backend", 8080, 0)
+				a.ServiceNamespace = "bad_namespace"
+				a.HealthCheckCrossNamespaceAllowed = true
+				return a
+			},
+			want: "not a valid DNS-1123 label",
+		},
+		{
+			name: "cross-namespace without consent",
+			app: func() *sdapp.App {
+				a := healthCheckApp("uid", "app-backend", 8080, 0)
+				a.ServiceNamespace = "team-b"
+				return a
+			},
+			want: "no ReferenceGrant",
+		},
+		{
+			name: "protected namespace",
+			app: func() *sdapp.App {
+				a := healthCheckApp("uid", "app-backend", 8080, 0)
+				a.ServiceNamespace = "keycloak"
+				a.HealthCheckCrossNamespaceAllowed = true
+				return a
+			},
+			want: `namespace "keycloak" is protected`,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, reason := buildHealthCheckConfig(tt.app())
+			if cfg != nil {
+				t.Fatalf("expected health check to be dropped, got %+v", cfg)
+			}
+			if !strings.Contains(reason, tt.want) {
+				t.Errorf("reason = %q, want it to contain %q", reason, tt.want)
+			}
+		})
+	}
+
+	if cfg, reason := buildHealthCheckConfig(makeApp("uid", "app", "team-a", "app.example.com", &sdapp.LandingPage{Enabled: true})); cfg != nil || reason != "" {
+		t.Errorf("unconfigured health check: got %+v / %q, want nil / empty reason", cfg, reason)
+	}
+}
+
+// A dropped health check is logged once per change of reason, not on every
+// watcher update of the same NebariApp.
+func TestAdd_LogsDroppedHealthCheckOncePerChange(t *testing.T) {
+	var lines []string
+	c := NewServiceCache()
+	c.log = funcr.New(func(_, args string) { lines = append(lines, args) }, funcr.Options{})
+
+	denied := healthCheckApp("uid-log", "app-backend", 8080, 0)
+	denied.ServiceNamespace = "team-b"
+	for i := 0; i < 3; i++ {
+		c.Add(denied)
+	}
+	if len(lines) != 1 || !strings.Contains(lines[0], "no ReferenceGrant") {
+		t.Fatalf("after repeated identical updates got logs %q, want one drop log", lines)
+	}
+
+	protected := healthCheckApp("uid-log", "app-backend", 8080, 6379)
+	c.Add(protected)
+	c.Add(protected)
+	if len(lines) != 2 || !strings.Contains(lines[1], "port 6379 is protected") {
+		t.Fatalf("after reason change got logs %q, want a second drop log", lines)
+	}
+
+	c.Add(healthCheckApp("uid-log", "app-backend", 8080, 0))
+	c.Add(healthCheckApp("uid-log", "app-backend", 8080, 0))
+	if len(lines) != 3 || !strings.Contains(lines[2], "enabled again") {
+		t.Fatalf("after fix got logs %q, want one re-enabled log", lines)
+	}
+
+	c.Add(protected)
+	c.Remove("uid-log")
+	c.Add(protected)
+	if len(lines) != 5 {
+		t.Fatalf("after remove and re-add got logs %q, want the drop logged again", lines)
 	}
 }
 

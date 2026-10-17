@@ -457,7 +457,9 @@ func (w *NebariAppWatcher) crossNamespaceHealthCheckAllowed(ctx context.Context,
 			return true
 		}
 	}
-	log.Info("Cross-namespace health check denied; no ReferenceGrant permits target Service",
+	// Debug level: the service cache logs the dropped health check, with this
+	// reason, once per change; this path runs on every NebariApp update.
+	log.V(1).Info("Cross-namespace health check denied; no ReferenceGrant permits target Service",
 		"name", a.Name,
 		"namespace", a.Namespace,
 		"targetNamespace", a.ServiceNamespace,
