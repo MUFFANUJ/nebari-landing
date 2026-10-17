@@ -642,27 +642,6 @@ func TestHandleDebug_IncludesJWTValidatorStatsAndCapsAuthorizationHeader(t *test
 	}
 }
 
-func TestHandleMetrics_ExposesJWTValidatorStatsWithoutDebug(t *testing.T) {
-	h := NewHandler(cache.NewServiceCache(), &auth.JWTValidator{}, true, nil, nil)
-
-	rr := doGet(t, h.Routes(), "/metrics")
-	if rr.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", rr.Code)
-	}
-
-	body := rr.Body.String()
-	for _, want := range []string{
-		"nebari_landing_jwt_validator_configured 1",
-		"nebari_landing_jwt_validator_ready 0",
-		"nebari_landing_jwks_refresh_attempts_total 0",
-		"nebari_landing_unknown_kid_cache_entries 0",
-	} {
-		if !strings.Contains(body, want) {
-			t.Errorf("metrics response missing %q:\n%s", want, body)
-		}
-	}
-}
-
 func TestHandleDebug_AuthenticatedUser_ShowsClaims(t *testing.T) {
 	sc := buildCache(
 		entry{"u1", "pub", "public", "", 0},
