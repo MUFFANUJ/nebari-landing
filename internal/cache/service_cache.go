@@ -118,6 +118,12 @@ type HealthCheckConfig struct {
 	ProbeURL        string
 	IntervalSeconds int
 	TimeoutSeconds  int
+	// Trusted marks a probe that comes from operator configuration (a static
+	// entry's healthCheck.url in the webapi's chart values) rather than from a
+	// NebariApp author. The health checker probes trusted configs directly
+	// from the webapi: NebariApp target validation and the probe runner apply
+	// only to untrusted configs.
+	Trusted bool
 }
 
 // HealthStatus represents the health status of a service
@@ -365,18 +371,15 @@ func buildURL(a *sdapp.App) string {
 // health checking is disabled or not configured, and a nil config with the
 // reason when a requested check is dropped because its target is not allowed.
 //
-// The checks here apply to NebariApp-sourced input, which any author who can
-// create a NebariApp controls. Operator-configured health checks (chart
-// values) are trusted and should not be routed through this function.
+// The target checks apply to NebariApp-sourced input, which any author who can
+// create a NebariApp controls. Static entries are operator configuration
+// (chart values): their full probe URL is taken as given and the config is
+// marked Trusted, so the health checker probes it directly from the webapi.
 func buildHealthCheckConfig(a *sdapp.App) (*HealthCheckConfig, string) {
 	if a.LandingPage == nil || a.LandingPage.HealthCheck == nil || !a.LandingPage.HealthCheck.Enabled {
 		return nil, ""
 	}
 	hc := a.LandingPage.HealthCheck
-	path, ok := normalizeHealthCheckPath(hc.Path)
-	if !ok {
-		return nil, fmt.Sprintf("healthCheck.path %q is not a valid absolute request path", hc.Path)
-	}
 
 	interval := clampHealthCheckSeconds(
 		hc.IntervalSeconds,
@@ -393,12 +396,25 @@ func buildHealthCheckConfig(a *sdapp.App) (*HealthCheckConfig, string) {
 	if timeout > interval {
 		timeout = interval
 	}
-	if hc.URL != "" {
+	if a.Static {
+		if hc.URL == "" {
+			return nil, "static healthCheck has no url"
+		}
 		return &HealthCheckConfig{
 			ProbeURL:        hc.URL,
 			IntervalSeconds: interval,
 			TimeoutSeconds:  timeout,
+			Trusted:         true,
 		}, ""
+	}
+	// A full probe URL is operator-only: a NebariApp must probe its declared
+	// Service, so the address is built from the Service reference below.
+	if hc.URL != "" {
+		return nil, "healthCheck.url is accepted only from static configuration"
+	}
+	path, ok := normalizeHealthCheckPath(hc.Path)
+	if !ok {
+		return nil, fmt.Sprintf("healthCheck.path %q is not a valid absolute request path", hc.Path)
 	}
 	// Probe the Kubernetes service directly using in-cluster DNS so the health
 	// check bypasses the ingress/gateway and always uses HTTP regardless of

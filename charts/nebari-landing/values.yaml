@@ -282,6 +282,11 @@ webapi:
   #         url: http://grafana.monitoring.svc:3000/api/health
   #         intervalSeconds: 30
   #         timeoutSeconds: 5
+  # A static healthCheck.url is trusted operator config: the webapi probes it
+  # itself, not through healthProber, and NebariApp target rules do not apply.
+  # With webapi.networkPolicy.enabled, allow the target's pod port in
+  # webapi.networkPolicy.egress.additionalRules (the Keycloak card's probe is
+  # already covered by egress.keycloak).
   staticServices: {}
 
   # Automatic platform notifications — require Redis (notifications.enabled implies redis.enabled).
@@ -350,6 +355,9 @@ webapi:
 
       # Required when Keycloak JWT/JWKS/admin calls stay in-cluster. Keep this
       # selector narrow; the defaults match the keycloakx release used by NIC.
+      # Also carries the Keycloak card's health probe
+      # (webapi.keycloak.landingPage), which the webapi sends to
+      # webapi.keycloak.url directly rather than through healthProber.
       keycloak:
         enabled: true
         namespaceSelector:

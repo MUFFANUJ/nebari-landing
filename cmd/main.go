@@ -307,7 +307,7 @@ func main() {
 			setupLog.Error(err, "Invalid health probe runner URL")
 			os.Exit(1)
 		}
-		setupLog.Info("Health probes delegated to isolated runner", "url", probeRunnerURL)
+		setupLog.Info("NebariApp health probes delegated to isolated runner; static entries are probed directly", "url", probeRunnerURL)
 	}
 	healthChecker.SetPublisher(hub)
 	if notifLifecycle {

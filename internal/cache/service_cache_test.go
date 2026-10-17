@@ -793,3 +793,61 @@ func TestAdd_ResetsHealthWhenHealthCheckIsRemoved(t *testing.T) {
 		t.Fatalf("expected health to reset to unknown, got %+v", svc.Health)
 	}
 }
+
+func TestBuildHealthCheckConfig_StaticURLIsTrusted(t *testing.T) {
+	a := &sdapp.App{
+		UID:    "static-keycloak",
+		Name:   "keycloak",
+		Static: true,
+		LandingPage: &sdapp.LandingPage{Enabled: true, HealthCheck: &sdapp.HealthCheck{
+			Enabled:         true,
+			URL:             "http://keycloak.keycloak.svc:8080/realms/nebari",
+			IntervalSeconds: 1,
+		}},
+	}
+	cfg, reason := buildHealthCheckConfig(a)
+	if cfg == nil {
+		t.Fatalf("expected a config for the static entry, dropped: %s", reason)
+	}
+	want := HealthCheckConfig{
+		ProbeURL:        "http://keycloak.keycloak.svc:8080/realms/nebari",
+		IntervalSeconds: minHealthCheckIntervalSeconds,
+		TimeoutSeconds:  defaultHealthCheckTimeoutSeconds,
+		Trusted:         true,
+	}
+	if *cfg != want {
+		t.Fatalf("config = %+v, want %+v", *cfg, want)
+	}
+}
+
+func TestBuildHealthCheckConfig_NebariAppConfigsAreUntrusted(t *testing.T) {
+	cfg, reason := buildHealthCheckConfig(untrustedHealthCheckApp())
+	if cfg == nil {
+		t.Fatalf("expected a config, dropped: %s", reason)
+	}
+	if cfg.Trusted {
+		t.Fatal("a NebariApp health check must not be trusted")
+	}
+}
+
+func TestBuildHealthCheckConfig_RejectsURLFromNebariApp(t *testing.T) {
+	a := untrustedHealthCheckApp()
+	a.LandingPage.HealthCheck.URL = "http://keycloak.keycloak.svc:8080/realms/nebari"
+	cfg, reason := buildHealthCheckConfig(a)
+	if cfg != nil {
+		t.Fatalf("expected a NebariApp-supplied probe URL to be dropped, got %+v", *cfg)
+	}
+	if !strings.Contains(reason, "static configuration") {
+		t.Fatalf("reason = %q, want it to name static configuration", reason)
+	}
+}
+
+func untrustedHealthCheckApp() *sdapp.App {
+	a := makeApp("uid-untrusted", "app", "team-a", "app.example.com", &sdapp.LandingPage{
+		Enabled:     true,
+		HealthCheck: &sdapp.HealthCheck{Enabled: true, Path: "/ready"},
+	})
+	a.ServiceName = "app-backend"
+	a.ServicePort = 8080
+	return a
+}

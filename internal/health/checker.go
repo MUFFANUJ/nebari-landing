@@ -40,7 +40,14 @@ type HealthChecker struct {
 	publisher      Publisher             // optional; may be nil
 	notifPublisher NotificationPublisher // optional; may be nil
 	notifStore     *notifications.Store  // optional; when set, "back online" notifications are posted
+	// probeRequester runs untrusted (NebariApp) probes: through the isolated
+	// probe runner when one is configured, otherwise directly.
 	probeRequester probeRequester
+	// trustedProbeRequester runs trusted (operator-configured static entry)
+	// probes, always directly from the webapi. The probe runner's NebariApp
+	// target rules would reject them (e.g. an in-cluster Keycloak URL), and
+	// the operator, not a NebariApp author, chose the target.
+	trustedProbeRequester probeRequester
 	// running maps UID → (cancel func, current config). The config is stored so
 	// reconcile can detect changes and restart the probe goroutine when a
 	// NebariApp's healthCheck spec is updated.
@@ -57,22 +64,27 @@ type probeRequester interface {
 	Probe(ctx context.Context, uid string, cfg *cache.HealthCheckConfig) probeResult
 }
 
-type directProbeRequester struct{}
+// directProbeRequester probes from the webapi process itself. transport is
+// nil in production (http.DefaultTransport); tests set it to redirect dials.
+type directProbeRequester struct {
+	transport http.RoundTripper
+}
 
 // NewHealthChecker creates a new health checker.
 // interval is the fallback polling interval used when a service's
 // HealthCheckConfig doesn't specify one.
 func NewHealthChecker(serviceCache *cache.ServiceCache, interval time.Duration) *HealthChecker {
 	return &HealthChecker{
-		cache:          serviceCache,
-		interval:       interval,
-		probeRequester: directProbeRequester{},
-		running:        make(map[string]runningProbe),
+		cache:                 serviceCache,
+		interval:              interval,
+		probeRequester:        directProbeRequester{},
+		trustedProbeRequester: directProbeRequester{},
+		running:               make(map[string]runningProbe),
 	}
 }
 
-// SetProbeRunnerURL delegates health probes to a separate probe-runner HTTP
-// service. Keeping the runner in its own pod lets Kubernetes NetworkPolicy give
+// SetProbeRunnerURL delegates untrusted (NebariApp) health probes to a
+// separate probe-runner HTTP service; trusted static-entry probes stay direct. Keeping the runner in its own pod lets Kubernetes NetworkPolicy give
 // probe traffic a narrower egress policy than the main webapi pod needs for
 // Redis, Keycloak, and Kubernetes API access.
 func (h *HealthChecker) SetProbeRunnerURL(rawURL string) error {
@@ -252,12 +264,25 @@ func (h *HealthChecker) probeLoop(ctx context.Context, uid string, cfg *cache.He
 	}
 }
 
-func (directProbeRequester) Probe(ctx context.Context, uid string, cfg *cache.HealthCheckConfig) probeResult {
+func (r directProbeRequester) Probe(ctx context.Context, uid string, cfg *cache.HealthCheckConfig) probeResult {
 	timeout := time.Duration(cfg.TimeoutSeconds) * time.Second
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
-	return performProbeRequest(ctx, uid, cfg.ProbeURL, newProbeHTTPClient(timeout))
+	client := newProbeHTTPClient(timeout)
+	if r.transport != nil {
+		client.Transport = r.transport
+	}
+	return performProbeRequest(ctx, uid, cfg.ProbeURL, client)
+}
+
+// requesterFor picks how cfg is probed: trusted operator config directly,
+// NebariApp config through the (possibly remote) untrusted requester.
+func (h *HealthChecker) requesterFor(cfg *cache.HealthCheckConfig) probeRequester {
+	if cfg.Trusted {
+		return h.trustedProbeRequester
+	}
+	return h.probeRequester
 }
 
 func newProbeHTTPClient(timeout time.Duration) *http.Client {
@@ -285,7 +310,7 @@ func (h *HealthChecker) probeIfCurrent(ctx context.Context, uid string, cfg *cac
 		h.forgetRunningProbe(uid, cfg)
 		return false
 	}
-	result := h.probeRequester.Probe(ctx, uid, cfg)
+	result := h.requesterFor(cfg).Probe(ctx, uid, cfg)
 	if !h.cache.UpdateHealthIfCurrent(uid, cfg, result.healthStatus()) {
 		log.Info("Probe config changed while request was in flight; discarding stale result", "uid", uid, "url", cfg.ProbeURL)
 		h.forgetRunningProbe(uid, cfg)
