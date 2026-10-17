@@ -178,8 +178,20 @@ webapi:
       limits:
         cpu: 100m
         memory: 64Mi
+    # Egress NetworkPolicy for the prober pod (opt-in). The webapi already
+    # restricts probe targets (declared backend Service only, ReferenceGrant
+    # consent for cross-namespace targets, protected namespaces and ports
+    # rejected); this policy adds a network-level limit on top.
+    #
+    # NetworkPolicy ports match the DESTINATION POD port (the Service's
+    # targetPort / containerPort), not the Service port the probe URL uses.
+    # Most packs expose Service port 80 in front of a different pod port, e.g.
+    # nebi 80 -> 8460, JupyterHub proxy-public 80 -> 8000, Grafana 80 -> 3000.
+    # List the pod ports of every probed backend in ports before enabling it;
+    # otherwise those probes are dropped, time out, and the cards show as
+    # unhealthy.
     networkPolicy:
-      enabled: true
+      enabled: false
       egress:
         dns:
           enabled: true
@@ -187,10 +199,9 @@ webapi:
             kubernetes.io/metadata.name: kube-system
           podSelector:
             k8s-app: kube-dns
-        # Health checks are app-side constrained to the declared backend and
-        # require Gateway API ReferenceGrant consent for cross-namespace targets.
-        # This runner policy is the only default health-target egress path; it
-        # must exclude metadata, control-plane, database, and identity classes.
+        # Allowed health-target pods. The namespace selector must exclude the
+        # metadata, control-plane, database, and identity namespaces (rendering
+        # fails otherwise), and ports must not include protected ports.
         sameNamespaceHealthChecks:
           enabled: true
           namespaceSelector:
@@ -218,6 +229,7 @@ webapi:
                   - mongo
                   - vault
           podSelector: {}
+          # Destination pod ports (targetPort), not Service ports.
           ports:
             - 80
             - 8080
