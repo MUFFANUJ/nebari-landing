@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
-	"golang.org/x/sync/singleflight"
 	ctrl "sigs.k8s.io/controller-runtime"
 )
 
@@ -100,10 +99,11 @@ type JWTValidator struct {
 	publicKeys map[string]*rsa.PublicKey
 	keysMu     sync.RWMutex
 	lastFetch  time.Time
-	// refreshGroup coalesces concurrent request-time refreshes. The initial
-	// background fetch path stays direct so startup retry logging remains simple.
-	refreshGroup singleflight.Group
-	refreshMu    sync.Mutex
+	// refreshMu guards lastRefreshAttempt and refreshCall. refreshCall is the
+	// in-flight request-time refresh; concurrent callers wait on it instead of
+	// starting their own. The initial background fetch path stays direct so
+	// startup retry logging remains simple.
+	refreshMu sync.Mutex
 	// lastRefreshAttempt tracks failed attempts too; lastFetch only records
 	// successful key loads.
 	lastRefreshAttempt time.Time
@@ -136,6 +136,8 @@ type JWTValidator struct {
 	stopOnce sync.Once
 }
 
+// jwksRefreshCall is one in-flight JWKS refresh. err is written before done
+// is closed, so it may be read without a lock once done is closed.
 type jwksRefreshCall struct {
 	done chan struct{}
 	err  error
@@ -504,39 +506,32 @@ func (v *JWTValidator) fetchPublicKeysOnce() error {
 	return nil
 }
 
+// refreshPublicKeysIfDue starts a refresh, or joins the one already in
+// flight, and waits for its result. It returns errJWKSRefreshSkipped when the
+// cooldown blocks a new refresh.
 func (v *JWTValidator) refreshPublicKeysIfDue() error {
-	call, skipped := v.startPublicKeysRefresh()
+	call, skipped := v.startPublicKeysRefresh(false)
 	if skipped {
 		return errJWKSRefreshSkipped
 	}
-	if call == nil {
-		return nil
-	}
 	<-call.done
-	v.refreshMu.Lock()
-	err := call.err
-	v.refreshMu.Unlock()
-	return err
+	return call.err
 }
 
+// refreshPublicKeysIfDueAsync starts a background refresh when none is in
+// flight and the cooldown allows. Callers that coalesce onto a running
+// refresh return immediately; only the refresh this call starts logs a
+// failure, so a hung Keycloak produces one log line rather than one per
+// request.
 func (v *JWTValidator) refreshPublicKeysIfDueAsync() {
-	call, _ := v.startPublicKeysRefresh()
-	if call == nil {
-		return
-	}
-
-	go func() {
-		<-call.done
-		v.refreshMu.Lock()
-		err := call.err
-		v.refreshMu.Unlock()
-		if err != nil {
-			log.Error(err, "Failed to refresh public keys")
-		}
-	}()
+	v.startPublicKeysRefresh(true)
 }
 
-func (v *JWTValidator) startPublicKeysRefresh() (*jwksRefreshCall, bool) {
+// startPublicKeysRefresh returns the in-flight refresh, starting one when
+// none is running. skipped is true (and call nil) when the cooldown blocks a
+// new refresh. logFailure makes a refresh started by this call log its own
+// error, for callers that do not wait for the result.
+func (v *JWTValidator) startPublicKeysRefresh(logFailure bool) (call *jwksRefreshCall, skipped bool) {
 	now := time.Now()
 	v.keysMu.RLock()
 	lastFetch := v.lastFetch
@@ -559,19 +554,17 @@ func (v *JWTValidator) startPublicKeysRefresh() (*jwksRefreshCall, bool) {
 	}
 
 	v.lastRefreshAttempt = now
-	call := &jwksRefreshCall{done: make(chan struct{})}
+	call = &jwksRefreshCall{done: make(chan struct{})}
 	v.refreshCall = call
-	ch := v.refreshGroup.DoChan("jwks-refresh", func() (interface{}, error) {
-		return nil, v.fetchPublicKeys()
-	})
 
 	go func() {
-		res := <-ch
-		v.refreshMu.Lock()
-		call.err = res.Err
-		if v.refreshCall == call {
-			v.refreshCall = nil
+		err := v.fetchPublicKeys()
+		if err != nil && logFailure {
+			log.Error(err, "Failed to refresh public keys")
 		}
+		v.refreshMu.Lock()
+		call.err = err
+		v.refreshCall = nil
 		close(call.done)
 		v.refreshMu.Unlock()
 	}()
