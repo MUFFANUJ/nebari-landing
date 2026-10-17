@@ -271,28 +271,28 @@ func newProbeHTTPClient(timeout time.Duration) *http.Client {
 	}
 }
 
+// probeIfCurrent runs one probe for cfg and stores the result, unless cfg is
+// no longer the service's active config. The cache lock is not held during the
+// probe: a probe can take the full configured timeout (plus the hop to the
+// probe runner), and holding even a read lock that long queues every cache
+// writer and, behind them, every reader (watcher updates, GET /services).
+// Instead the config is checked before the probe and re-checked atomically
+// with the write, so a result for a config that changed mid-flight is dropped.
 func (h *HealthChecker) probeIfCurrent(ctx context.Context, uid string, cfg *cache.HealthCheckConfig) bool {
-	prevStatus := ""
-	var result probeResult
-	if !h.cache.WithCurrentHealthCheck(uid, cfg, func(currentPrevStatus string) {
-		prevStatus = currentPrevStatus
-		result = h.probeRequester.Probe(ctx, uid, cfg)
-	}) {
+	prevStatus, current := h.cache.HealthStatusIfCurrent(uid, cfg)
+	if !current {
 		log.Info("Probe config no longer current; stopping probe loop", "uid", uid, "url", cfg.ProbeURL)
 		h.forgetRunningProbe(uid, cfg)
 		return false
 	}
-	if !h.probeConfigCurrent(uid, cfg) {
+	result := h.probeRequester.Probe(ctx, uid, cfg)
+	if !h.cache.UpdateHealthIfCurrent(uid, cfg, result.healthStatus()) {
 		log.Info("Probe config changed while request was in flight; discarding stale result", "uid", uid, "url", cfg.ProbeURL)
 		h.forgetRunningProbe(uid, cfg)
 		return false
 	}
-	h.applyProbeResult(uid, prevStatus, result)
+	h.afterHealthUpdate(uid, prevStatus, result.status)
 	return true
-}
-
-func (h *HealthChecker) probeConfigCurrent(uid string, cfg *cache.HealthCheckConfig) bool {
-	return h.cache.HealthCheckConfigCurrent(uid, cfg)
 }
 
 func (h *HealthChecker) forgetRunningProbe(uid string, cfg *cache.HealthCheckConfig) {
@@ -321,6 +321,15 @@ type probeResult struct {
 	status    string
 	message   string
 	checkedAt time.Time
+}
+
+func (r probeResult) healthStatus() *cache.HealthStatus {
+	checkedAt := r.checkedAt
+	return &cache.HealthStatus{
+		Status:    r.status,
+		LastCheck: &checkedAt,
+		Message:   r.message,
+	}
 }
 
 func performProbeRequest(ctx context.Context, uid, probeURL string, client *http.Client) probeResult {
@@ -441,14 +450,14 @@ func (r *remoteProbeRequester) Probe(ctx context.Context, uid string, cfg *cache
 }
 
 func (h *HealthChecker) applyProbeResult(uid, prevStatus string, result probeResult) {
-	checkedAt := result.checkedAt
-	h.cache.UpdateHealth(uid, &cache.HealthStatus{
-		Status:    result.status,
-		LastCheck: &checkedAt,
-		Message:   result.message,
-	})
-	// Post a "back online" notification when recovering from unhealthy.
-	if result.status == "healthy" && prevStatus == "unhealthy" {
+	h.cache.UpdateHealth(uid, result.healthStatus())
+	h.afterHealthUpdate(uid, prevStatus, result.status)
+}
+
+// afterHealthUpdate posts the "back online" notification when a service
+// recovers from unhealthy and publishes the updated service.
+func (h *HealthChecker) afterHealthUpdate(uid, prevStatus, status string) {
+	if status == "healthy" && prevStatus == "unhealthy" {
 		h.postRecoveryNotif(uid)
 	}
 	h.publishIfChanged(uid)

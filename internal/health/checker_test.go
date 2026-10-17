@@ -124,3 +124,133 @@ func (r *countingProbeRequester) Probe(context.Context, string, *cache.HealthChe
 	r.called = true
 	return probeResult{status: "healthy", checkedAt: time.Now(), message: fmt.Sprintf("called=%v", r.called)}
 }
+
+// blockingProbeRequester parks every probe until release is closed, so a test
+// can act on the cache while a probe is in flight.
+type blockingProbeRequester struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func newBlockingProbeRequester() *blockingProbeRequester {
+	return &blockingProbeRequester{started: make(chan struct{}, 1), release: make(chan struct{})}
+}
+
+func (r *blockingProbeRequester) Probe(context.Context, string, *cache.HealthCheckConfig) probeResult {
+	r.started <- struct{}{}
+	<-r.release
+	return probeResult{status: "healthy", checkedAt: time.Now(), message: "HTTP 200"}
+}
+
+func healthCheckedApp(uid, path string) *sdapp.App {
+	return &sdapp.App{
+		UID:         uid,
+		Name:        "app",
+		Namespace:   "team-a",
+		Hostname:    "app.example.com",
+		TLSEnabled:  true,
+		ServiceName: "app-backend",
+		ServicePort: 8080,
+		LandingPage: &sdapp.LandingPage{Enabled: true, HealthCheck: &sdapp.HealthCheck{Enabled: true, Path: path}},
+	}
+}
+
+// startBlockedProbe starts probeIfCurrent for uid in the background and waits
+// until the probe request is in flight.
+func startBlockedProbe(t *testing.T, checker *HealthChecker, requester *blockingProbeRequester, uid string, cfg *cache.HealthCheckConfig) <-chan bool {
+	t.Helper()
+	done := make(chan bool, 1)
+	go func() { done <- checker.probeIfCurrent(context.Background(), uid, cfg) }()
+	select {
+	case <-requester.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("probe never started")
+	}
+	return done
+}
+
+// TestProbeIfCurrentDoesNotHoldCacheLockDuringProbe guards against holding the
+// cache lock across the HTTP probe: a slow or dropped target must not stall
+// watcher writes (Add) or API reads (GetAll) for unrelated services.
+func TestProbeIfCurrentDoesNotHoldCacheLockDuringProbe(t *testing.T) {
+	serviceCache := cache.NewServiceCache()
+	serviceCache.Add(healthCheckedApp("uid-slow", "/ready"))
+	cfg := *serviceCache.Get("uid-slow").HealthCheckConfig
+
+	requester := newBlockingProbeRequester()
+	checker := NewHealthChecker(serviceCache, time.Second)
+	checker.probeRequester = requester
+	probeDone := startBlockedProbe(t, checker, requester, "uid-slow", &cfg)
+	defer close(requester.release)
+
+	// Add takes the write lock; if the probe held the read lock this would
+	// block until release, and GetAll would queue behind it.
+	cacheDone := make(chan struct{})
+	go func() {
+		defer close(cacheDone)
+		serviceCache.Add(makeOtherApp("uid-other"))
+		_ = serviceCache.GetAll()
+	}()
+	select {
+	case <-cacheDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cache.Add/GetAll blocked while a health probe was in flight")
+	}
+
+	requester.release <- struct{}{}
+	if !<-probeDone {
+		t.Fatal("expected probe with unchanged config to report current")
+	}
+	if got := serviceCache.Get("uid-slow").Health.Status; got != "healthy" {
+		t.Fatalf("health status = %q, want healthy", got)
+	}
+}
+
+// TestProbeIfCurrentDiscardsResultWhenConfigChangesMidProbe checks that, with
+// the lock released during the probe, a result for a config that was replaced
+// while the request was in flight is dropped rather than written over the new
+// config's status.
+func TestProbeIfCurrentDiscardsResultWhenConfigChangesMidProbe(t *testing.T) {
+	serviceCache := cache.NewServiceCache()
+	serviceCache.Add(healthCheckedApp("uid-changed", "/ready"))
+	cfg := *serviceCache.Get("uid-changed").HealthCheckConfig
+
+	requester := newBlockingProbeRequester()
+	checker := NewHealthChecker(serviceCache, time.Second)
+	checker.probeRequester = requester
+	checker.running["uid-changed"] = runningProbe{cancel: func() {}, config: cfg}
+	probeDone := startBlockedProbe(t, checker, requester, "uid-changed", &cfg)
+
+	addDone := make(chan struct{})
+	go func() {
+		defer close(addDone)
+		serviceCache.Add(healthCheckedApp("uid-changed", "/healthz"))
+	}()
+	select {
+	case <-addDone:
+	case <-time.After(2 * time.Second):
+		close(requester.release)
+		t.Fatal("cache.Add blocked while a health probe was in flight")
+	}
+	close(requester.release)
+
+	if <-probeDone {
+		t.Fatal("expected probe for a replaced config to stop")
+	}
+	if got := serviceCache.Get("uid-changed").Health.Status; got != "unknown" {
+		t.Fatalf("health status = %q, want unknown (stale result discarded)", got)
+	}
+	if _, ok := checker.running["uid-changed"]; ok {
+		t.Fatal("expected stale running probe bookkeeping to be cleared")
+	}
+}
+
+func makeOtherApp(uid string) *sdapp.App {
+	return &sdapp.App{
+		UID:         uid,
+		Name:        "other",
+		Namespace:   "team-b",
+		Hostname:    "other.example.com",
+		LandingPage: &sdapp.LandingPage{Enabled: true},
+	}
+}

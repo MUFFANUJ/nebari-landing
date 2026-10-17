@@ -271,33 +271,42 @@ func (c *ServiceCache) UpdateHealth(uid string, status *HealthStatus) {
 	}
 }
 
-// WithCurrentHealthCheck runs fn only while uid still has cfg as its active
-// health-check configuration. The read lock is held for fn so writers that
-// remove or replace cfg cannot interleave between the freshness check and the
-// protected operation.
-func (c *ServiceCache) WithCurrentHealthCheck(uid string, cfg *HealthCheckConfig, fn func(prevStatus string)) bool {
+// HealthStatusIfCurrent reports whether uid still has cfg as its active
+// health-check configuration and, if so, the service's current health status.
+// The lock is held only for the lookup: callers must not hold it across a
+// network probe, which can take up to the probe timeout.
+func (c *ServiceCache) HealthStatusIfCurrent(uid string, cfg *HealthCheckConfig) (prevStatus string, current bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
 	service := c.services[uid]
-	if service == nil || service.HealthCheckConfig == nil || cfg == nil || *service.HealthCheckConfig != *cfg {
-		return false
+	if !healthCheckConfigMatches(service, cfg) {
+		return "", false
 	}
-	prevStatus := ""
 	if service.Health != nil {
 		prevStatus = service.Health.Status
 	}
-	fn(prevStatus)
+	return prevStatus, true
+}
+
+// UpdateHealthIfCurrent stores status for uid only while uid still has cfg as
+// its active health-check configuration. The currency check and the write
+// happen under the same lock, so a result from a probe whose config was
+// replaced or revoked while the request was in flight is discarded instead of
+// overwriting the new config's status. It reports whether status was stored.
+func (c *ServiceCache) UpdateHealthIfCurrent(uid string, cfg *HealthCheckConfig, status *HealthStatus) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	service := c.services[uid]
+	if !healthCheckConfigMatches(service, cfg) {
+		return false
+	}
+	service.Health = status
 	return true
 }
 
-// HealthCheckConfigCurrent reports whether uid still has cfg as its active
-// health-check configuration.
-func (c *ServiceCache) HealthCheckConfigCurrent(uid string, cfg *HealthCheckConfig) bool {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	service := c.services[uid]
+func healthCheckConfigMatches(service *ServiceInfo, cfg *HealthCheckConfig) bool {
 	return service != nil && service.HealthCheckConfig != nil && cfg != nil && *service.HealthCheckConfig == *cfg
 }
 
