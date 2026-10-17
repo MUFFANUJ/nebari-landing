@@ -1392,7 +1392,7 @@ func (h *Handler) canAccessService(service *cache.ServiceInfo, authenticated boo
 	if claims != nil {
 		groups = claims.Groups
 	}
-	return canAccessPolicy(service.Visibility, authenticated, service.RequiredGroups, groups, hasApprovedService(approvedServices, service.UID))
+	return canAccessPolicy(service.Visibility, authenticated, service.RequiredGroups, groups, approvalGrantsAccess(service, approvedServices))
 }
 
 // CanAccessService implements websocket.ServiceAccessPolicy. The hub calls it
@@ -1403,7 +1403,7 @@ func (h *Handler) CanAccessService(service *cache.ServiceInfo, p wshub.Principal
 		return false
 	}
 	approvedServices := h.cachedApprovedServiceUIDsForUser(p.Subject, p.Authenticated)
-	return canAccessPolicy(service.Visibility, p.Authenticated, service.RequiredGroups, p.Groups, hasApprovedService(approvedServices, service.UID))
+	return canAccessPolicy(service.Visibility, p.Authenticated, service.RequiredGroups, p.Groups, approvalGrantsAccess(service, approvedServices))
 }
 
 // canAccessPolicy is the pure access decision shared by the REST and
@@ -1430,6 +1430,17 @@ func canAccessPolicy(visibility string, authenticated bool, requiredGroups, user
 		// Unknown / legacy visibility values default to private semantics.
 		return authenticated && (approved || hasRequiredGroups(userGroups, requiredGroups))
 	}
+}
+
+// approvalGrantsAccess reports whether an approved access request lets the
+// caller see service. Both REST (canAccessService) and the WebSocket fan-out
+// (CanAccessService) go through it. Static entries never honour approvals:
+// they do their own auth and are gated by requiredGroups alone (e.g. the
+// Keycloak admin console behind /nebari-admins). handleRequestAccess already
+// rejects requests for them; this keeps an approval that reaches the store
+// some other way from exposing the card.
+func approvalGrantsAccess(service *cache.ServiceInfo, approvedServices map[string]struct{}) bool {
+	return !service.Static && hasApprovedService(approvedServices, service.UID)
 }
 
 func hasApprovedService(approvedServices map[string]struct{}, serviceUID string) bool {

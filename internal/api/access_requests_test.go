@@ -40,6 +40,21 @@ func resolveAccessRequestForTest(t *testing.T, store *accessrequests.Store, id s
 	return updated
 }
 
+// approveForTest stores an approved, unexpired access request for userID on
+// serviceUID directly in the store, bypassing handleRequestAccess.
+func approveForTest(t *testing.T, store *accessrequests.Store, serviceUID, serviceName, userID string) {
+	t.Helper()
+	ar, err := store.Create(serviceUID, serviceName, userID, userID+"@example.com", "")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	expiresAt := time.Now().UTC().Add(time.Hour)
+	resolveAccessRequestForTest(t, store, ar.ID, accessrequests.Resolution{
+		Status:    accessrequests.StatusApproved,
+		ExpiresAt: &expiresAt,
+	})
+}
+
 // addStaticKeycloak adds the static Keycloak admin-console entry, gated on
 // /nebari-admins, as the chart renders it from webapi.keycloak.landingPage.
 func addStaticKeycloak(sc *cache.ServiceCache) {
@@ -699,5 +714,54 @@ func TestCanAccessService_RefreshesApprovedSnapshotAfterInterval(t *testing.T) {
 	time.Sleep(15 * time.Millisecond)
 	if h.CanAccessService(service, principal) {
 		t.Fatal("expected cached WebSocket approval to refresh after revoke")
+	}
+}
+
+func TestApprovalNeverExposesStaticService(t *testing.T) {
+	// handleRequestAccess rejects static services, but an approval that
+	// reaches the store some other way must still not expose the card: the
+	// static Keycloak entry is gated on /nebari-admins alone. svc-a is the
+	// control showing the same approval does grant a NebariApp service.
+	sc := cache.NewServiceCache()
+	addStaticKeycloak(sc)
+	addPrivateService(sc, "svc-a", "private-a", []string{"team-a"})
+
+	store := newARStore(t)
+	approveForTest(t, store, "static-keycloak", "keycloak", "user-subject")
+	approveForTest(t, store, "svc-a", "private-a", "user-subject")
+
+	h := NewHandler(sc, nil, true, nil, nil,
+		WithAccessRequestStore(store),
+		WithClaimsExtractor(func(_ *http.Request) (*auth.Claims, bool) {
+			return &auth.Claims{
+				PreferredUsername: "alice",
+				Groups:            []string{"/users"},
+				RegisteredClaims:  jwt.RegisteredClaims{Subject: "user-subject"},
+			}, true
+		}),
+	)
+
+	rr := doGet(t, h.Routes(), "/api/v1/services")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var resp ServiceResponse
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Services) != 1 || resp.Services[0].ID != "svc-a" {
+		t.Fatalf("expected only svc-a, got %+v", resp.Services)
+	}
+
+	if rr := doGet(t, h.Routes(), "/api/v1/services/static-keycloak"); rr.Code != http.StatusForbidden {
+		t.Errorf("GET /services/static-keycloak: expected 403, got %d", rr.Code)
+	}
+
+	principal := wshub.Principal{Subject: "user-subject", Groups: []string{"/users"}, Authenticated: true}
+	if h.CanAccessService(sc.Get("static-keycloak"), principal) {
+		t.Error("WebSocket policy: approval must not expose the static service")
+	}
+	if !h.CanAccessService(sc.Get("svc-a"), principal) {
+		t.Error("WebSocket policy: approval should grant the NebariApp service")
 	}
 }
