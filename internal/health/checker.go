@@ -417,9 +417,14 @@ func (r *remoteProbeRequester) Probe(ctx context.Context, uid string, cfg *cache
 	}
 	req.Header.Set("Content-Type", "application/json")
 
+	// Failures between the webapi and the runner, and targets the runner
+	// refuses, say nothing about the target's health: report them as
+	// "unknown" with the reason so a policy denial or a runner outage does
+	// not look like the service being down. Only a result the runner actually
+	// measured can be "unhealthy".
 	resp, err := r.client.Do(req)
 	if err != nil {
-		return probeResult{status: "unhealthy", checkedAt: now, message: fmt.Sprintf("probe runner error: %v", err)}
+		return probeResult{status: "unknown", checkedAt: now, message: fmt.Sprintf("probe runner unavailable: %v", err)}
 	}
 	defer func() {
 		if closeErr := resp.Body.Close(); closeErr != nil {
@@ -429,11 +434,13 @@ func (r *remoteProbeRequester) Probe(ctx context.Context, uid string, cfg *cache
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return probeResult{
-			status:    "unhealthy",
-			checkedAt: now,
-			message:   fmt.Sprintf("probe runner HTTP %d: %s", resp.StatusCode, string(bytes.TrimSpace(body))),
+		reason := string(bytes.TrimSpace(body))
+		message := fmt.Sprintf("probe runner HTTP %d: %s", resp.StatusCode, reason)
+		if resp.StatusCode == http.StatusForbidden {
+			message = fmt.Sprintf("probe runner rejected target: %s", reason)
 		}
+		log.Info("Health probe not run by probe runner", "uid", uid, "url", cfg.ProbeURL, "status", resp.StatusCode, "reason", reason)
+		return probeResult{status: "unknown", checkedAt: now, message: message}
 	}
 
 	var out remoteProbeResponse

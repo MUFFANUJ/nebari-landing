@@ -254,3 +254,69 @@ func makeOtherApp(uid string) *sdapp.App {
 		LandingPage: &sdapp.LandingPage{Enabled: true},
 	}
 }
+
+func TestRemoteProbeRequesterReportsRunnerFailuresAsUnknown(t *testing.T) {
+	cfg := &cache.HealthCheckConfig{ProbeURL: "http://app-backend.team-a:8080/ready", IntervalSeconds: 30, TimeoutSeconds: 1}
+
+	tests := []struct {
+		name        string
+		handler     http.HandlerFunc
+		wantStatus  string
+		wantMessage string
+	}{
+		{
+			name: "runner rejects protected target",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				http.Error(w, "probe target is protected", http.StatusForbidden)
+			},
+			wantStatus:  "unknown",
+			wantMessage: "probe runner rejected target: probe target is protected",
+		},
+		{
+			name: "runner internal error",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				http.Error(w, "boom", http.StatusInternalServerError)
+			},
+			wantStatus:  "unknown",
+			wantMessage: "probe runner HTTP 500: boom",
+		},
+		{
+			name: "runner measured an unhealthy target",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"status":"unhealthy","message":"HTTP 503"}`))
+			},
+			wantStatus:  "unhealthy",
+			wantMessage: "HTTP 503",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(tt.handler)
+			defer server.Close()
+			requester, err := newRemoteProbeRequester(server.URL)
+			if err != nil {
+				t.Fatalf("newRemoteProbeRequester: %v", err)
+			}
+			got := requester.Probe(context.Background(), "uid", cfg)
+			if got.status != tt.wantStatus || got.message != tt.wantMessage {
+				t.Fatalf("Probe() = %q/%q, want %q/%q", got.status, got.message, tt.wantStatus, tt.wantMessage)
+			}
+		})
+	}
+}
+
+func TestRemoteProbeRequesterReportsUnreachableRunnerAsUnknown(t *testing.T) {
+	server := httptest.NewServer(http.NotFoundHandler())
+	runnerURL := server.URL
+	server.Close()
+
+	requester, err := newRemoteProbeRequester(runnerURL)
+	if err != nil {
+		t.Fatalf("newRemoteProbeRequester: %v", err)
+	}
+	got := requester.Probe(context.Background(), "uid", &cache.HealthCheckConfig{ProbeURL: "http://app-backend.team-a:8080/ready", TimeoutSeconds: 1})
+	if got.status != "unknown" {
+		t.Fatalf("status = %q (%s), want unknown", got.status, got.message)
+	}
+}
