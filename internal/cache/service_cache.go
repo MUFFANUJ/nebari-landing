@@ -91,6 +91,9 @@ type ServiceInfo struct {
 	RequiredGroups    []string           `json:"requiredGroups,omitempty"`
 	Health            *HealthStatus      `json:"health,omitempty"`
 	HealthCheckConfig *HealthCheckConfig `json:"-"` // not serialised; used by the health checker
+	// Static marks entries loaded from the webapi's static-services config.
+	// Not serialised: it only gates server-side behaviour (access requests).
+	Static bool `json:"-"`
 }
 
 // IconURL returns a single icon URL for theme-neutral contexts (e.g. notifications).
@@ -105,11 +108,13 @@ func (s *ServiceInfo) IconURL() string {
 }
 
 // HealthCheckConfig holds the resolved probe settings for a service.
-// It is populated by the watcher from spec.landingPage.healthCheck in the
-// NebariApp CRD and consumed exclusively by the health checker.
+// It is built in Add from the App's health check (spec.landingPage.healthCheck
+// for a NebariApp, healthCheck for a static entry) and consumed exclusively by
+// the health checker.
 type HealthCheckConfig struct {
 	// ProbeURL is the full HTTP URL the health checker will GET on each interval.
-	// Constructed as http://<service-name>.<namespace>:<port><path>.
+	// Constructed as http://<service-name>.<namespace>:<port><path>, unless the
+	// health check gives a complete URL (static entries).
 	ProbeURL        string
 	IntervalSeconds int
 	TimeoutSeconds  int
@@ -190,6 +195,7 @@ func (c *ServiceCache) Add(a *sdapp.App) {
 		RequiredGroups:    lp.RequiredGroups,
 		Health:            health,
 		HealthCheckConfig: healthCheckConfig,
+		Static:            a.Static,
 	}
 
 	c.services[a.UID] = service
@@ -387,7 +393,13 @@ func buildHealthCheckConfig(a *sdapp.App) (*HealthCheckConfig, string) {
 	if timeout > interval {
 		timeout = interval
 	}
-
+	if hc.URL != "" {
+		return &HealthCheckConfig{
+			ProbeURL:        hc.URL,
+			IntervalSeconds: interval,
+			TimeoutSeconds:  timeout,
+		}, ""
+	}
 	// Probe the Kubernetes service directly using in-cluster DNS so the health
 	// check bypasses the ingress/gateway and always uses HTTP regardless of
 	// whether TLS is configured for external access.

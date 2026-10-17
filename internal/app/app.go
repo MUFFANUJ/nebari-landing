@@ -8,13 +8,16 @@
 package app
 
 // App is the internal representation of a Nebari application that participates
-// in service discovery. It is derived from a NebariApp CR by the watcher and
-// passed to the ServiceCache.
+// in service discovery. It is derived from a NebariApp CR by the watcher, or
+// from a static entry by internal/staticservices, and passed to the
+// ServiceCache. The field comments below describe the NebariApp mapping; a
+// static entry sets UID, Name, Static and LandingPage only.
 type App struct {
-	// UID is the Kubernetes UID of the underlying NebariApp.
+	// UID is the Kubernetes UID of the underlying NebariApp, or
+	// "static-<id>" for a static entry.
 	UID string
 
-	// Name is the name of the NebariApp CR.
+	// Name is the name of the NebariApp CR, or the id of a static entry.
 	Name string
 
 	// Namespace is the namespace of the NebariApp CR.
@@ -44,6 +47,12 @@ type App struct {
 	// Service lives outside Namespace and that target namespace has explicitly
 	// granted this NebariApp namespace permission to reference the Service.
 	HealthCheckCrossNamespaceAllowed bool
+
+	// Static is true for entries loaded from the webapi's static-services
+	// configuration rather than from a NebariApp CR. Static entries are not
+	// reconciled from the cluster and do not accept access requests: access to
+	// them is managed by the target service itself, not by the landing page.
+	Static bool
 
 	// LandingPage holds the resolved landing-page configuration, or nil when
 	// the application does not participate in service discovery.
@@ -99,7 +108,8 @@ type LandingPage struct {
 }
 
 // HealthCheck holds the health-probing configuration derived from
-// spec.landingPage.healthCheck in the NebariApp CRD.
+// spec.landingPage.healthCheck in the NebariApp CRD, or from a static entry's
+// healthCheck.
 type HealthCheck struct {
 	// Enabled mirrors spec.landingPage.healthCheck.enabled.
 	Enabled bool
@@ -121,4 +131,9 @@ type HealthCheck struct {
 	// The probe still targets the declared Service; protected ports are
 	// rejected. When 0, spec.service.port is used.
 	Port int
+
+	// URL is a complete probe URL that overrides the in-cluster address built
+	// from ServiceName/ServiceNamespace/ServicePort. Set only for static
+	// entries, which have no Kubernetes Service reference of their own.
+	URL string
 }

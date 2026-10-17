@@ -4,17 +4,21 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/nebari-dev/nebari-landing/internal/accessrequests"
+	sdapp "github.com/nebari-dev/nebari-landing/internal/app"
 	"github.com/nebari-dev/nebari-landing/internal/cache"
+	webkeycloak "github.com/nebari-dev/nebari-landing/internal/keycloak"
 )
 
 // newARStore creates a miniredis-backed access request store for tests.
@@ -60,6 +64,91 @@ func TestHandleRequestAccess_ServiceNotFound(t *testing.T) {
 	newARHandler(cache.NewServiceCache(), newARStore(t)).Routes().ServeHTTP(rr, req)
 	if rr.Code != http.StatusNotFound {
 		t.Errorf("expected 404, got %d", rr.Code)
+	}
+}
+
+func TestHandleRequestAccess_StaticService_Returns403(t *testing.T) {
+	// Approving a request grants the service's requiredGroups in Keycloak, so a
+	// static entry (e.g. the Keycloak admin console gated on /nebari-admins)
+	// must never accept one.
+	sc := cache.NewServiceCache()
+	sc.Add(&sdapp.App{
+		UID:    "static-keycloak",
+		Name:   "keycloak",
+		Static: true,
+		LandingPage: &sdapp.LandingPage{
+			Enabled:        true,
+			DisplayName:    "Keycloak",
+			Visibility:     "private",
+			RequiredGroups: []string{"/nebari-admins"},
+			ExternalURL:    "https://keycloak.example.com/admin/nebari/console/",
+		},
+	})
+	store := newARStore(t)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/services/static-keycloak/request_access", nil)
+	rr := httptest.NewRecorder()
+	newARHandler(sc, store).Routes().ServeHTTP(rr, req)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d — body: %s", rr.Code, rr.Body.String())
+	}
+
+	all, err := store.ListAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 0 {
+		t.Errorf("expected no access request to be stored, got %d", len(all))
+	}
+}
+
+func TestApplyKeycloakGroupMembership_StaticService_SkipsGrant(t *testing.T) {
+	// handleRequestAccess already rejects static services, so this guards the
+	// approval step itself: a request for a static entry that reaches the store
+	// some other way must not make any Keycloak call. The NebariApp case is the
+	// control showing the fake Keycloak does see a grant attempt.
+	tests := []struct {
+		name      string
+		static    bool
+		wantCalls bool
+	}{
+		{"static entry", true, false},
+		{"NebariApp", false, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var calls atomic.Int32
+			kc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				calls.Add(1)
+				http.Error(w, "unavailable", http.StatusServiceUnavailable)
+			}))
+			t.Cleanup(kc.Close)
+
+			sc := cache.NewServiceCache()
+			sc.Add(&sdapp.App{
+				UID:    "static-keycloak",
+				Name:   "keycloak",
+				Static: tt.static,
+				LandingPage: &sdapp.LandingPage{
+					Enabled:        true,
+					DisplayName:    "Keycloak",
+					Visibility:     "private",
+					RequiredGroups: []string{"/nebari-admins"},
+					ExternalURL:    "https://keycloak.example.com/admin/nebari/console/",
+				},
+			})
+			h := NewHandler(sc, nil, false, nil, nil, WithKeycloakAdminClient(webkeycloak.New(webkeycloak.Config{
+				URL: kc.URL, Realm: "nebari", AdminUsername: "admin", AdminPassword: "secret",
+			})))
+
+			h.applyKeycloakGroupMembership(context.Background(), &accessrequests.AccessRequest{
+				ServiceUID: "static-keycloak", ServiceName: "keycloak", UserID: "alice",
+			})
+
+			if got := calls.Load() > 0; got != tt.wantCalls {
+				t.Errorf("Keycloak called = %v (%d requests), want %v", got, calls.Load(), tt.wantCalls)
+			}
+		})
 	}
 }
 
