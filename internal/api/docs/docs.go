@@ -661,7 +661,7 @@ const docTemplate = `{
                                 }
                             }
                         },
-                        "description": "Invalid status transition"
+                        "description": "Invalid status transition, or approving a request filed before the upgrade to subject-keyed records"
                     },
                     "501": {
                         "content": {

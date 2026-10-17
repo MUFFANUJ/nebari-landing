@@ -464,7 +464,8 @@ paths:
             application/json:
               schema:
                 type: string
-          description: Invalid status transition
+          description: Invalid status transition, or approving a request filed before
+            the upgrade to subject-keyed records
         "501":
           content:
             application/json:

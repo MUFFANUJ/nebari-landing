@@ -56,6 +56,37 @@ per WS connection.
 Non-browser clients can skip the ticket exchange and send the Bearer token
 directly on the upgrade. The `/ws` endpoint accepts either mechanism.
 
+## Access requests
+
+A user files a request with `POST /services/{id}/request_access`; an admin
+then decides it under `/admin/access-requests`. The allowed status changes
+are:
+
+| From | To | Endpoint |
+|------|----|----------|
+| `pending` | `approved` | `PUT /admin/access-requests/{id}/approve` |
+| `pending` | `denied` | `PUT /admin/access-requests/{id}/deny` |
+| `approved` | `revoked` | `PUT /admin/access-requests/{id}/revoke` or `DELETE /admin/access-requests/{id}` |
+
+Any other change (for example re-approving a revoked request, or denying one
+that is already approved) returns `409 Conflict`. Denied and revoked requests
+are final; the user files a new request instead.
+
+### Upgrade note: requests filed before subject-keyed records
+
+Earlier releases keyed access requests by the caller's `preferred_username`.
+They are now keyed by the JWT `sub` claim, and approvals are looked up by
+`sub`. A request that was still pending when you upgraded is keyed by
+username, so approving it could never grant anything; the webapi refuses to
+approve such a request and returns `409 Conflict`. Deny it and ask the user
+to request access again (the new request is keyed by `sub` and can be
+approved). Before upgrading you can also resolve every pending request.
+
+Requests approved by earlier releases added the user to the service's
+Keycloak groups. This release does not track or remove those memberships;
+revoking an old approval only updates its record. Remove the group
+membership in Keycloak to take that access away.
+
 ---
 
 <!-- gendocs:api -->

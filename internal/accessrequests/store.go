@@ -44,6 +44,17 @@ const (
 // deleteIfMatchesScript deletes KEYS[1] only when it still holds ARGV[1]. It
 // is used for the active and dedup keys so an old request can never clear a
 // key that a newer request for the same user/service now owns.
+// recordVersionField marks records whose UserID is the caller's stable JWT
+// subject. Records without it were written before access requests switched
+// from preferred_username to sub; their UserID is a username, so approving
+// them would create an entitlement that no subject-keyed lookup ever finds.
+// Once no deployment still holds pending pre-switch records, the field and
+// the legacy check in Resolve can be removed.
+const (
+	recordVersionField   = "recordVersion"
+	recordVersionSubject = "2"
+)
+
 const deleteIfMatchesScript = `
 if redis.call("GET", KEYS[1]) == ARGV[1] then
 	return redis.call("DEL", KEYS[1])
@@ -94,6 +105,10 @@ type AccessRequest struct {
 	// ExpiresAt is set for approved landing-owned entitlements. Once this time
 	// passes, the approval no longer grants service access.
 	ExpiresAt *time.Time `json:"expiresAt,omitempty"`
+
+	// legacyUserKey is true for records written before UserID switched from
+	// preferred_username to the JWT subject (no recordVersion field).
+	legacyUserKey bool
 }
 
 // Resolution records the admin action used to resolve or revoke an access
@@ -126,6 +141,12 @@ var (
 	// status does not allow the requested change. Only pending->approved,
 	// pending->denied, and approved->revoked are allowed.
 	ErrInvalidTransition = errors.New("access request status transition not allowed")
+
+	// ErrLegacyRequest is returned by Resolve when approving a request that
+	// was filed before UserID switched from preferred_username to the JWT
+	// subject. Such a request can still be denied; the user then files a new
+	// one, which is keyed by subject.
+	ErrLegacyRequest = errors.New("access request predates subject-keyed records and cannot be approved; deny it and ask the user to request access again")
 )
 
 // Store is a Redis-backed persistent store for AccessRequest records.
@@ -193,6 +214,7 @@ func (s *Store) CreateWithOwner(serviceUID, serviceName, targetOwner, userID, us
 			"message", req.Message,
 			"status", string(req.Status),
 			"requestedAt", ts,
+			recordVersionField, recordVersionSubject,
 		)
 		z := redis.Z{Score: score, Member: req.ID}
 		pipe.ZAdd(ctx, arAllKey, z)
@@ -393,6 +415,9 @@ func (s *Store) Resolve(id string, resolution Resolution) (*AccessRequest, error
 		if !allowedTransition(req.Status, resolution.Status) {
 			return fmt.Errorf("%w: %s -> %s", ErrInvalidTransition, req.Status, resolution.Status)
 		}
+		if req.legacyUserKey && resolution.Status == StatusApproved {
+			return ErrLegacyRequest
+		}
 		now := time.Now().UTC()
 		req.Status = resolution.Status
 		req.ResolvedAt = &now
@@ -494,6 +519,9 @@ func arFromHash(f map[string]string) (*AccessRequest, error) {
 		Message:     f["message"],
 		Status:      Status(f["status"]),
 		RequestedAt: reqAt,
+		// Records written before the switch to subject-keyed UserIDs carry no
+		// recordVersion; see recordVersionField.
+		legacyUserKey: f[recordVersionField] == "",
 	}
 	if s := f["resolvedAt"]; s != "" {
 		t, err := time.Parse(time.RFC3339Nano, s)

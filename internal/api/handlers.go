@@ -1058,7 +1058,7 @@ func (h *Handler) handleAdminAccessRequestSub(w http.ResponseWriter, r *http.Req
 //	@Failure		403		{string}	string	"Forbidden: admin group required"
 //	@Failure		404		{string}	string	"Request not found"
 //	@Failure		405		{string}	string	"Method not allowed"
-//	@Failure		409		{string}	string	"Invalid status transition"
+//	@Failure		409		{string}	string	"Invalid status transition, or approving a request filed before the upgrade to subject-keyed records"
 //	@Failure		501		{string}	string	"Access request feature not configured"
 //	@Security		BearerAuth
 //	@Router			/admin/access-requests/{id}/{action} [put]
@@ -1127,6 +1127,10 @@ func (h *Handler) writeAccessRequestResolution(w http.ResponseWriter, id string,
 		}
 		if errors.Is(err, accessrequests.ErrInvalidStatus) {
 			http.Error(w, "Bad request", http.StatusBadRequest)
+			return
+		}
+		if errors.Is(err, accessrequests.ErrLegacyRequest) {
+			http.Error(w, "This access request was filed before access requests were keyed by user subject and cannot be approved: deny it and ask the user to request access again", http.StatusConflict)
 			return
 		}
 		if errors.Is(err, accessrequests.ErrInvalidTransition) {

@@ -553,6 +553,86 @@ func TestResolve_RevokeExpiredApproval_KeepsNewerDedupLock(t *testing.T) {
 	}
 }
 
+// writeLegacyPending stores a pending request exactly as releases before the
+// switch to subject-keyed records did: UserID is the preferred_username and
+// there is no recordVersion field.
+func writeLegacyPending(t *testing.T, s *Store, id, username string) {
+	t.Helper()
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if err := s.rdb.HSet(ctx, arKey(id),
+		"id", id,
+		"serviceUID", svcUID,
+		"serviceName", svcName,
+		"userID", username,
+		"userEmail", "",
+		"message", "",
+		"status", string(StatusPending),
+		"requestedAt", now.Format(time.RFC3339Nano),
+	).Err(); err != nil {
+		t.Fatalf("write legacy hash: %v", err)
+	}
+	z := redis.Z{Score: float64(now.UnixMilli()), Member: id}
+	for _, key := range []string{arAllKey, arPendingKey, arUserKey(username)} {
+		if err := s.rdb.ZAdd(ctx, key, z).Err(); err != nil {
+			t.Fatalf("index legacy request: %v", err)
+		}
+	}
+	if err := s.rdb.Set(ctx, arDedupKey(username, svcUID), id, 0).Err(); err != nil {
+		t.Fatalf("write legacy dedup key: %v", err)
+	}
+}
+
+// A request filed before the upgrade is keyed by username. Approving it would
+// write active:{username}:{svc}, which the subject-keyed lookup never reads,
+// so the API would report "approved" while granting nothing. Approval must be
+// refused; deny still works so admins can clear the queue.
+func TestResolve_LegacyUsernameKeyedRequest_CannotBeApproved(t *testing.T) {
+	s := newStore(t)
+	writeLegacyPending(t, s, "legacy-1", "alice")
+
+	expiresAt := time.Now().UTC().Add(time.Hour)
+	if _, err := s.Resolve("legacy-1", Resolution{Status: StatusApproved, ExpiresAt: &expiresAt}); !errors.Is(err, ErrLegacyRequest) {
+		t.Fatalf("approve legacy request: expected ErrLegacyRequest, got %v", err)
+	}
+	got, err := s.Get("legacy-1")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Status != StatusPending {
+		t.Fatalf("refused approval must leave the request pending, got %q", got.Status)
+	}
+	if n, err := s.rdb.Exists(context.Background(), arActiveKey("alice", svcUID)).Result(); err != nil || n != 0 {
+		t.Fatalf("refused approval must not write an active key (exists=%d, err=%v)", n, err)
+	}
+
+	denied := resolveForTest(t, s, "legacy-1", Resolution{Status: StatusDenied, ResolvedBy: "admin"})
+	if denied.Status != StatusDenied {
+		t.Fatalf("expected legacy request to be deniable, got %q", denied.Status)
+	}
+	pending, err := s.ListPending()
+	if err != nil {
+		t.Fatalf("ListPending: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("expected empty pending queue after deny, got %+v", pending)
+	}
+
+	// The user's new request is subject-keyed and approvable.
+	fresh, err := s.Create(svcUID, svcName, "alice-subject", "", "")
+	if err != nil {
+		t.Fatalf("create subject-keyed request: %v", err)
+	}
+	resolveForTest(t, s, fresh.ID, Resolution{Status: StatusApproved, ExpiresAt: &expiresAt})
+	active, err := s.ListActiveServiceUIDs("alice-subject", time.Now().UTC())
+	if err != nil {
+		t.Fatalf("ListActiveServiceUIDs: %v", err)
+	}
+	if _, ok := active[svcUID]; !ok {
+		t.Fatalf("expected subject-keyed approval to grant access, got %+v", active)
+	}
+}
+
 func TestResolve_PersistedAcrossTwoClients(t *testing.T) {
 	// Verify status update visible from a second Store client on the same Redis.
 	mr := miniredis.RunT(t)
