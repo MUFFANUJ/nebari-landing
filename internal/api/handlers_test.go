@@ -9,7 +9,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	sdapp "github.com/nebari-dev/nebari-landing/internal/app"
 	"github.com/nebari-dev/nebari-landing/internal/auth"
@@ -661,45 +660,6 @@ func TestHandleMetrics_ExposesJWTValidatorStatsWithoutDebug(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("metrics response missing %q:\n%s", want, body)
 		}
-	}
-}
-
-func TestRequestSource_UsesProxyAppendedForwardedIP(t *testing.T) {
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/services", nil)
-	req.RemoteAddr = "10.2.0.15:41234"
-	req.Header.Set("X-Forwarded-For", "198.51.100.250, 203.0.113.10")
-	req.Header.Set("X-Real-IP", "10.2.0.15")
-
-	if got := requestSource(req); got != "203.0.113.10" {
-		t.Errorf("expected proxy-appended forwarded IP, got %q", got)
-	}
-}
-
-func TestAuthFailureLimiter_LimitsPerSourceAndGlobally(t *testing.T) {
-	now := time.Unix(100, 0)
-	limiter := newAuthFailureLimiter(time.Minute, 2, 3, 10)
-	limiter.now = func() time.Time { return now }
-
-	if limiter.limited("10.0.0.1") {
-		t.Fatal("fresh source should not be limited")
-	}
-	limiter.recordFailure("10.0.0.1")
-	limiter.recordFailure("10.0.0.1")
-	if !limiter.limited("10.0.0.1") {
-		t.Fatal("source should be limited after reaching source threshold")
-	}
-	if limiter.limited("10.0.0.2") {
-		t.Fatal("different source should not be source-limited before global threshold")
-	}
-
-	limiter.recordFailure("10.0.0.2")
-	if !limiter.limited("10.0.0.2") {
-		t.Fatal("all sources should be limited after reaching global threshold")
-	}
-
-	now = now.Add(time.Minute)
-	if limiter.limited("10.0.0.1") {
-		t.Fatal("source should be allowed after the window rolls over")
 	}
 }
 

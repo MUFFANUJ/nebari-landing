@@ -6,10 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/nebari-dev/nebari-landing/internal/accessrequests"
@@ -25,13 +23,9 @@ import (
 
 var log = ctrl.Log.WithName("api")
 
-const (
-	maxAuthorizationHeaderBytes = 64*1024 + len("Bearer ")
-	authFailureWindow           = time.Minute
-	authFailurePerSourceLimit   = 60
-	authFailureGlobalLimit      = 600
-	authFailureMaxSources       = 4096
-)
+// maxAuthorizationHeaderBytes caps the Authorization header before JWT
+// parsing. It matches auth's 64 KiB token cap plus the "Bearer " prefix.
+const maxAuthorizationHeaderBytes = 64*1024 + len("Bearer ")
 
 // Handler handles HTTP requests for the landing page API
 type Handler struct {
@@ -67,10 +61,6 @@ type Handler struct {
 	// Use WithClaimsExtractor in tests to inject synthetic claims without
 	// needing a real Keycloak instance or signed token.
 	claimsExtractor func(*http.Request) (*auth.Claims, bool)
-	// authFailureLimiter dampens repeated bad-token validation work by source
-	// and globally. It is process-local and intentionally applies only after
-	// observed validation failures; valid traffic is not pre-emptively charged.
-	authFailureLimiter *authFailureLimiter
 	// wsTicketStore, when non-nil, enables the POST /api/v1/ws-ticket endpoint.
 	// Browsers cannot send Authorization headers on WebSocket upgrade requests,
 	// so the frontend exchanges a short-lived single-use ticket via that endpoint
@@ -166,12 +156,6 @@ func NewHandler(serviceCache *cache.ServiceCache, jwtValidator *auth.JWTValidato
 		pinStore:       pinStore,
 		adminGroup:     "admin",
 		allowedOrigins: []string{"*"},
-		authFailureLimiter: newAuthFailureLimiter(
-			authFailureWindow,
-			authFailurePerSourceLimit,
-			authFailureGlobalLimit,
-			authFailureMaxSources,
-		),
 	}
 	for _, opt := range opts {
 		opt(h)
@@ -352,144 +336,6 @@ func expFromClaims(claims *auth.Claims) time.Time {
 		return time.Time{}
 	}
 	return claims.ExpiresAt.Time
-}
-
-type authFailureBucket struct {
-	windowStart time.Time
-	count       int
-}
-
-type authFailureLimiter struct {
-	mu             sync.Mutex
-	window         time.Duration
-	perSourceLimit int
-	globalLimit    int
-	maxSources     int
-	sources        map[string]authFailureBucket
-	global         authFailureBucket
-	now            func() time.Time
-}
-
-func newAuthFailureLimiter(window time.Duration, perSourceLimit, globalLimit, maxSources int) *authFailureLimiter {
-	return &authFailureLimiter{
-		window:         window,
-		perSourceLimit: perSourceLimit,
-		globalLimit:    globalLimit,
-		maxSources:     maxSources,
-		sources:        make(map[string]authFailureBucket),
-		now:            time.Now,
-	}
-}
-
-func (l *authFailureLimiter) limited(source string) bool {
-	if l == nil {
-		return false
-	}
-	now := l.now()
-
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	l.global.resetIfExpired(now, l.window)
-	sourceBucket := l.sourceBucketLocked(source, now)
-	return l.globalLimit > 0 && l.global.count >= l.globalLimit ||
-		l.perSourceLimit > 0 && sourceBucket.count >= l.perSourceLimit
-}
-
-func (l *authFailureLimiter) recordFailure(source string) {
-	if l == nil {
-		return
-	}
-	now := l.now()
-
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	l.global.resetIfExpired(now, l.window)
-	l.global.count++
-
-	sourceBucket := l.sourceBucketLocked(source, now)
-	sourceBucket.count++
-	l.sources[source] = sourceBucket
-}
-
-func (l *authFailureLimiter) recordSuccess(source string) {
-	if l == nil {
-		return
-	}
-	l.mu.Lock()
-	delete(l.sources, source)
-	l.mu.Unlock()
-}
-
-func (l *authFailureLimiter) sourceBucketLocked(source string, now time.Time) authFailureBucket {
-	if source == "" {
-		source = "unknown"
-	}
-	sourceBucket := l.sources[source]
-	sourceBucket.resetIfExpired(now, l.window)
-
-	if _, exists := l.sources[source]; !exists && l.maxSources > 0 && len(l.sources) >= l.maxSources {
-		l.pruneSourcesLocked(now)
-	}
-	if _, exists := l.sources[source]; !exists && l.maxSources > 0 && len(l.sources) >= l.maxSources {
-		for cachedSource := range l.sources {
-			delete(l.sources, cachedSource)
-			break
-		}
-	}
-	l.sources[source] = sourceBucket
-	return sourceBucket
-}
-
-func (l *authFailureLimiter) pruneSourcesLocked(now time.Time) {
-	for source, bucket := range l.sources {
-		bucket.resetIfExpired(now, l.window)
-		if bucket.count == 0 {
-			delete(l.sources, source)
-		}
-	}
-}
-
-func (b *authFailureBucket) resetIfExpired(now time.Time, window time.Duration) {
-	if b.windowStart.IsZero() || window <= 0 || now.Sub(b.windowStart) >= window {
-		b.windowStart = now
-		b.count = 0
-	}
-}
-
-func requestSource(r *http.Request) string {
-	// nginx appends its direct peer address to X-Forwarded-For before proxying
-	// to the webapi; use that rightmost entry so client-supplied prefixes cannot
-	// pick their own rate-limit bucket.
-	if forwardedFor := r.Header.Get("X-Forwarded-For"); forwardedFor != "" {
-		parts := strings.Split(forwardedFor, ",")
-		if source := normalizeIP(parts[len(parts)-1]); source != "" {
-			return source
-		}
-	}
-	if source := normalizeIP(r.Header.Get("X-Real-IP")); source != "" {
-		return source
-	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err == nil && host != "" {
-		return host
-	}
-	if r.RemoteAddr != "" {
-		return r.RemoteAddr
-	}
-	return "unknown"
-}
-
-func normalizeIP(value string) string {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return ""
-	}
-	if ip := net.ParseIP(value); ip != nil {
-		return ip.String()
-	}
-	return ""
 }
 
 // WSTicketResponse is the response body for POST /api/v1/ws-ticket.
@@ -1413,11 +1259,6 @@ func (h *Handler) extractAndValidateJWT(r *http.Request) (*auth.Claims, bool, er
 	}
 
 	tokenString := parts[1]
-	source := requestSource(r)
-	if h.authFailureLimiter != nil && h.authFailureLimiter.limited(source) {
-		log.Info("JWT validation temporarily rate limited", "source", source, "path", r.URL.Path)
-		return nil, false, fmt.Errorf("JWT validation temporarily rate limited")
-	}
 
 	claims, err := h.jwtValidator.ValidateToken(tokenString)
 	if err != nil {
@@ -1426,17 +1267,11 @@ func (h *Handler) extractAndValidateJWT(r *http.Request) (*auth.Claims, bool, er
 			// degrading the user to anonymous during the warmup window.
 			return nil, false, err
 		}
-		if h.authFailureLimiter != nil {
-			h.authFailureLimiter.recordFailure(source)
-		}
 		log.Info("JWT validation failed",
 			"error", err.Error(),
 			"path", r.URL.Path,
 			"hint", "check KEYCLOAK_ISSUER_URL matches the 'iss' claim in the token")
 		return nil, false, err
-	}
-	if h.authFailureLimiter != nil {
-		h.authFailureLimiter.recordSuccess(source)
 	}
 
 	if h.debugMode {
