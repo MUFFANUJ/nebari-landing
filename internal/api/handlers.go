@@ -707,7 +707,7 @@ type RequestAccessBody struct {
 // when the access-request store is not configured.
 //
 //	@Summary		Request access to a private service
-//	@Description	Requires authentication. Creates a pending access request for the caller against the named service; an admin then approves, denies, or revokes via /admin/access-requests. Approval makes only this service visible on the caller's launchpad until expiresAt; it does not change Keycloak groups, so the service itself may still require group membership and refuse the user.
+//	@Description	Requires authentication. Creates a pending access request for the caller against the named service; an admin then approves, denies, or revokes via /admin/access-requests. Approval makes only this service visible on the caller's launchpad until expiresAt; it does not change Keycloak groups, so the service itself may still require group membership and refuse the user. Static entries (static-<id> UIDs) reject requests with 403, so an approval can never expose their card.
 //	@Tags			services
 //	@Accept			json
 //	@Produce		json

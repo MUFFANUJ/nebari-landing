@@ -265,8 +265,9 @@ A few things to keep in mind:
 - **Group values must match the token's `groups` claim exactly.** On NIC the realm's groups mapper emits full paths
   such as `/nebari-admins`. The local dev realm (`dev/keycloak/`) sets `full.path=false` on the SPA client, so
   there the claim holds bare names (`nebari-admins`). The group must already exist in the realm.
-- **No access requests.** Approving a request adds the user to the service's `requiredGroups`, so static entries
-  reject access requests with `403` rather than turning an approval into a privilege grant.
+- **No access requests.** An approved request shows the service's card on the requester's launchpad regardless of
+  `requiredGroups`. Static entries reject access requests with `403`, and the webapi ignores any approval for one,
+  so an approval can never expose a card such as the Keycloak admin console to someone outside `/nebari-admins`.
 
 
 ## Quick Start

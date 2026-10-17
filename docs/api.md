@@ -88,6 +88,11 @@ an approval. To give someone working access to such a service, add them to
 one of its groups in Keycloak; the card then shows through the normal
 group check.
 
+Static entries (`static-<id>` UIDs, configured on the webapi rather than
+discovered from a `NebariApp`) are the exception: requests for them return
+`403 Forbidden`, and an approval never makes one visible, so an access request
+cannot expose a card gated on an admin group such as the Keycloak console.
+
 ### Upgrade note: requests filed before subject-keyed records
 
 Earlier releases keyed access requests by the caller's `preferred_username`.
@@ -323,7 +328,7 @@ curl -s -X GET http://localhost:8080/api/v1/services/{id} \
 
 Request access to a private service
 
-Requires authentication. Creates a pending access request for the caller against the named service; an admin then approves, denies, or revokes via /admin/access-requests. Approval makes only this service visible on the caller's launchpad until expiresAt; it does not change Keycloak groups, so the service itself may still require group membership and refuse the user.
+Requires authentication. Creates a pending access request for the caller against the named service; an admin then approves, denies, or revokes via /admin/access-requests. Approval makes only this service visible on the caller's launchpad until expiresAt; it does not change Keycloak groups, so the service itself may still require group membership and refuse the user. Static entries (static-<id> UIDs) reject requests with 403, so an approval can never expose their card.
 
 ```sh
 curl -s -X POST http://localhost:8080/api/v1/services/{id}/request_access \
