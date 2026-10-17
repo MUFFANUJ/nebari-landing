@@ -1102,10 +1102,42 @@ var _ = Describe("Webapi – Service Discovery", Ordered, func() {
 			Expect(ar.Status).To(Equal("approved"))
 		})
 
+		It("should refuse a second request while access is approved", func() {
+			body := `{"message":"already approved"}`
+			req, err := http.NewRequest(http.MethodPost,
+				webapiBase+"/api/v1/services/"+serviceUID+"/request_access",
+				strings.NewReader(body))
+			Expect(err).NotTo(HaveOccurred())
+			req.Header.Set("Authorization", "Bearer "+userToken)
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := http.DefaultClient.Do(req)
+			Expect(err).NotTo(HaveOccurred())
+			defer resp.Body.Close()
+			Expect(resp.StatusCode).To(Equal(http.StatusConflict),
+				"a request while an approval is active must be 409")
+		})
+
+		It("should revoke the approved access request as admin", func() {
+			req, err := http.NewRequest(http.MethodPut,
+				webapiBase+"/api/v1/admin/access-requests/"+requestID+"/revoke", nil)
+			Expect(err).NotTo(HaveOccurred())
+			req.Header.Set("Authorization", "Bearer "+adminToken)
+			resp, err := http.DefaultClient.Do(req)
+			Expect(err).NotTo(HaveOccurred())
+			defer resp.Body.Close()
+			Expect(resp.StatusCode).To(Equal(http.StatusOK),
+				"PUT /api/v1/admin/access-requests/{id}/revoke must return 200")
+			var ar struct {
+				Status string `json:"status"`
+			}
+			Expect(json.NewDecoder(resp.Body).Decode(&ar)).To(Succeed())
+			Expect(ar.Status).To(Equal("revoked"))
+		})
+
 		It("should create a second access request for the deny path", func() {
-			// A second AR is needed because the first was just approved; once
-			// resolved, an AR can't be denied. Same user/service is fine since
-			// ErrDuplicatePending only triggers while a request is still pending.
+			// The first request was approved and then revoked; once resolved it
+			// can't be denied, so the deny path needs a new request. A new one is
+			// accepted only once no request is pending and no approval is active.
 			body := `{"message":"second request to be denied"}`
 			req, err := http.NewRequest(http.MethodPost,
 				webapiBase+"/api/v1/services/"+serviceUID+"/request_access",
