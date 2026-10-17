@@ -138,7 +138,8 @@ webapi:
 
   # Landing-owned access-request entitlements.
   accessRequests:
-    # How long a newly approved request grants access before expiring.
+    # How long a newly approved request keeps the service on the requester's
+    # launchpad before expiring. Approvals do not change Keycloak groups.
     approvalTTL: "720h"
     # Maximum time a WebSocket connection may use a cached approval set.
     refreshInterval: "30s"

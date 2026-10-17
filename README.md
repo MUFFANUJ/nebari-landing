@@ -104,7 +104,7 @@ Release artifacts — the Go webapi binary (linux/darwin, amd64/arm64) and the p
 | **Service Discovery** | Automatically surfaces every `NebariApp` on the cluster — no manual registration required |
 | **Real-time Updates** | WebSocket hub pushes service changes and notifications to the browser instantly |
 | **SSO-Aware** | keycloak-js PKCE in the browser, JWT validation by the webapi — users land authenticated, admins see admin controls |
-| **Pins & Access Requests** | Users can pin favourite services and request access to restricted ones |
+| **Pins & Access Requests** | Users can pin favourite services and request access to restricted ones; an approval shows the service on their launchpad, but the service may still require group membership (see [docs/api.md](docs/api.md#access-requests)) |
 | **shadcn/ui + Tailwind** | Accessible UI primitives with theme tokens; no design-system runtime to ship |
 | **Runtime Branding** | Custom title, logo, favicon, CSS theme tokens, and classification banners — no image rebuild required |
 

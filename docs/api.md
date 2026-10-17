@@ -72,6 +72,22 @@ Any other change (for example re-approving a revoked request, or denying one
 that is already approved) returns `409 Conflict`. Denied and revoked requests
 are final; the user files a new request instead.
 
+### What an approval grants
+
+An approval is a landing-only entitlement for one user and one service. Until
+its `expiresAt` (chart value `webapi.accessRequests.approvalTTL`, default
+`720h`), the service's card appears on that user's launchpad and its events
+reach their WebSocket session. That is all it does: the webapi never changes
+Keycloak groups, and nothing in front of the service consults the approval.
+
+The service itself may still require group membership. Apps that check the
+`groups` claim on their own (JupyterHub, Grafana, and others) will keep
+refusing a user who is not in the right group, and when the nebari-operator
+enforces `auth.groups` at the gateway, a non-member gets `403` there even with
+an approval. To give someone working access to such a service, add them to
+one of its groups in Keycloak; the card then shows through the normal
+group check.
+
 ### Upgrade note: requests filed before subject-keyed records
 
 Earlier releases keyed access requests by the caller's `preferred_username`.
@@ -144,7 +160,7 @@ curl -s -X DELETE http://localhost:8080/api/v1/admin/access-requests/{id} \
 
 Approve, deny, or revoke an access request (admin)
 
-Action is encoded in the URL: PUT .../{id}/approve, .../{id}/deny, or .../{id}/revoke. Approving grants access only to the request's target service inside the landing API until its expiresAt timestamp; it records the human approver and target owner, and never creates or mutates Keycloak groups. Only pending requests can be approved or denied, and only approved requests can be revoked; any other transition returns 409.
+Action is encoded in the URL: PUT .../{id}/approve, .../{id}/deny, or .../{id}/revoke. Approving makes only the request's target service visible on the requester's launchpad until its expiresAt timestamp; it records the human approver and target owner, and never creates or mutates Keycloak groups, so the service itself may still require group membership and refuse the user. Only pending requests can be approved or denied, and only approved requests can be revoked; any other transition returns 409.
 
 ```sh
 curl -s -X PUT http://localhost:8080/api/v1/admin/access-requests/{id}/{action} \
@@ -307,7 +323,7 @@ curl -s -X GET http://localhost:8080/api/v1/services/{id} \
 
 Request access to a private service
 
-Requires authentication. Creates a pending access request for the caller against the named service; an admin then approves, denies, or revokes via /admin/access-requests. Approval grants access only to this service inside the landing API until expiresAt and does not mutate Keycloak groups.
+Requires authentication. Creates a pending access request for the caller against the named service; an admin then approves, denies, or revokes via /admin/access-requests. Approval makes only this service visible on the caller's launchpad until expiresAt; it does not change Keycloak groups, so the service itself may still require group membership and refuse the user.
 
 ```sh
 curl -s -X POST http://localhost:8080/api/v1/services/{id}/request_access \

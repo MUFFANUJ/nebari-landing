@@ -564,7 +564,7 @@
         },
         "/admin/access-requests/{id}/{action}": {
             "put": {
-                "description": "Action is encoded in the URL: PUT .../{id}/approve, .../{id}/deny, or .../{id}/revoke. Approving grants access only to the request's target service inside the landing API until its expiresAt timestamp; it records the human approver and target owner, and never creates or mutates Keycloak groups. Only pending requests can be approved or denied, and only approved requests can be revoked; any other transition returns 409.",
+                "description": "Action is encoded in the URL: PUT .../{id}/approve, .../{id}/deny, or .../{id}/revoke. Approving makes only the request's target service visible on the requester's launchpad until its expiresAt timestamp; it records the human approver and target owner, and never creates or mutates Keycloak groups, so the service itself may still require group membership and refuse the user. Only pending requests can be approved or denied, and only approved requests can be revoked; any other transition returns 409.",
                 "parameters": [
                     {
                         "description": "Access request ID",
@@ -1336,7 +1336,7 @@
         },
         "/services/{id}/request_access": {
             "post": {
-                "description": "Requires authentication. Creates a pending access request for the caller against the named service; an admin then approves, denies, or revokes via /admin/access-requests. Approval grants access only to this service inside the landing API until expiresAt and does not mutate Keycloak groups.",
+                "description": "Requires authentication. Creates a pending access request for the caller against the named service; an admin then approves, denies, or revokes via /admin/access-requests. Approval makes only this service visible on the caller's launchpad until expiresAt; it does not change Keycloak groups, so the service itself may still require group membership and refuse the user.",
                 "parameters": [
                     {
                         "description": "Service UID",

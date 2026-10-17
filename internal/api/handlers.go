@@ -704,7 +704,7 @@ type RequestAccessBody struct {
 // a pending request or active entitlement already exists, 501 when the access-request store is not configured.
 //
 //	@Summary		Request access to a private service
-//	@Description	Requires authentication. Creates a pending access request for the caller against the named service; an admin then approves, denies, or revokes via /admin/access-requests. Approval grants access only to this service inside the landing API until expiresAt and does not mutate Keycloak groups.
+//	@Description	Requires authentication. Creates a pending access request for the caller against the named service; an admin then approves, denies, or revokes via /admin/access-requests. Approval makes only this service visible on the caller's launchpad until expiresAt; it does not change Keycloak groups, so the service itself may still require group membership and refuse the user.
 //	@Tags			services
 //	@Accept			json
 //	@Produce		json
@@ -1047,7 +1047,7 @@ func (h *Handler) handleAdminAccessRequestSub(w http.ResponseWriter, r *http.Req
 // handleAdminResolveAccessRequest serves PUT /api/v1/admin/access-requests/{id}/{action}.
 //
 //	@Summary		Approve, deny, or revoke an access request (admin)
-//	@Description	Action is encoded in the URL: PUT .../{id}/approve, .../{id}/deny, or .../{id}/revoke. Approving grants access only to the request's target service inside the landing API until its expiresAt timestamp; it records the human approver and target owner, and never creates or mutates Keycloak groups. Only pending requests can be approved or denied, and only approved requests can be revoked; any other transition returns 409.
+//	@Description	Action is encoded in the URL: PUT .../{id}/approve, .../{id}/deny, or .../{id}/revoke. Approving makes only the request's target service visible on the requester's launchpad until its expiresAt timestamp; it records the human approver and target owner, and never creates or mutates Keycloak groups, so the service itself may still require group membership and refuse the user. Only pending requests can be approved or denied, and only approved requests can be revoked; any other transition returns 409.
 //	@Tags			admin
 //	@Produce		json
 //	@Param			id		path		string	true	"Access request ID"
