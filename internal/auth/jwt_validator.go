@@ -42,7 +42,9 @@ var (
 	// jwksRefreshMinInterval is a floor across on-demand refresh attempts. It
 	// prevents unknown-kid traffic from mapping 1:1 to outbound JWKS requests.
 	jwksRefreshMinInterval = time.Minute
-	// unknownKIDCacheTTL remembers key IDs that remained unknown after refresh.
+	// unknownKIDCacheTTL remembers key IDs that remained unknown after a
+	// successful refresh. Failed refreshes never populate the cache, and every
+	// successful fetch clears it.
 	unknownKIDCacheTTL = 5 * time.Minute
 	// unknownKIDCacheMaxEntries bounds memory used by the negative cache.
 	unknownKIDCacheMaxEntries = 1024
@@ -378,7 +380,10 @@ func (v *JWTValidator) ValidateToken(tokenString string) (*Claims, error) {
 				if errors.Is(refreshErr, errJWKSRefreshSkipped) {
 					return nil, fmt.Errorf("unknown key ID %s and key refresh skipped by cooldown: %w", kid, refreshErr)
 				}
-				v.rememberUnknownKID(kid)
+				// A failed refresh says nothing about whether the kid exists, so
+				// do not negatively cache it: a key Keycloak rotated in while
+				// the JWKS endpoint was down must validate as soon as it
+				// recovers. The cooldown still bounds retries.
 				return nil, fmt.Errorf("unknown key ID %s and key refresh failed: %w", kid, refreshErr)
 			}
 			v.keysMu.RLock()
@@ -488,6 +493,12 @@ func (v *JWTValidator) fetchPublicKeysOnce() error {
 	v.publicKeys = newPublicKeys
 	v.lastFetch = time.Now()
 	v.keysMu.Unlock()
+
+	// Negative entries describe the previous key set; drop them so a kid
+	// that was missing before this fetch is looked up afresh.
+	v.unknownKIDMu.Lock()
+	clear(v.unknownKIDs)
+	v.unknownKIDMu.Unlock()
 
 	log.Info("Public keys refreshed", "count", len(newPublicKeys))
 	return nil

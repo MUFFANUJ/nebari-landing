@@ -582,6 +582,88 @@ func TestValidateToken_UnknownKIDNegativeCacheSkipsRefreshAfterCooldown(t *testi
 	}
 }
 
+// Regression: a refresh that fails while Keycloak is unreachable must not
+// negatively cache the kid. Once the JWKS endpoint recovers with the rotated
+// key published, the token has to validate on the next refresh instead of
+// being rejected as "(cached)" until unknownKIDCacheTTL expires.
+func TestValidateToken_RotatedKIDValidatesAfterFailedRefreshRecovers(t *testing.T) {
+	withJWTRefreshSettings(t, 20*time.Millisecond, 5*time.Minute, 1024)
+
+	oldKey := generateTestKey(t)
+	newKey := generateTestKey(t)
+	const rotatedKID = "kid-2"
+
+	oldJWKS := jwksForKey(oldKey)
+	rotatedJWKS := map[string]interface{}{
+		"keys": []map[string]interface{}{
+			jwkForKey(oldKey, testKID),
+			jwkForKey(newKey, rotatedKID),
+		},
+	}
+
+	const (
+		serveOld = iota
+		serveError
+		serveRotated
+	)
+	var mode atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch mode.Load() {
+		case serveError:
+			http.Error(w, "keycloak unavailable", http.StatusInternalServerError)
+		case serveRotated:
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(rotatedJWKS)
+		default:
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(oldJWKS)
+		}
+	}))
+	defer srv.Close()
+
+	v := newValidator(t, srv)
+	issuer := fmt.Sprintf("%s/realms/%s", srv.URL, testRealm)
+	token := signJWTWithKID(t, newKey, issuer, time.Now().Add(time.Hour), rotatedKID, &Claims{PreferredUsername: "jdoe"})
+
+	mode.Store(serveError)
+	time.Sleep(2 * jwksRefreshMinInterval)
+	if _, err := v.ValidateToken(token); err == nil || !strings.Contains(err.Error(), "key refresh failed") {
+		t.Fatalf("expected refresh-failed error while JWKS returns 500, got %v", err)
+	}
+	if entries := v.Stats().UnknownKIDCacheEntries; entries != 0 {
+		t.Fatalf("failed refresh must not negatively cache the kid, got %d entries", entries)
+	}
+
+	mode.Store(serveRotated)
+	time.Sleep(2 * jwksRefreshMinInterval)
+	got, err := v.ValidateToken(token)
+	if err != nil {
+		t.Fatalf("rotated key should validate once JWKS recovers: %v", err)
+	}
+	if got.PreferredUsername != "jdoe" {
+		t.Errorf("username: got %q, want jdoe", got.PreferredUsername)
+	}
+}
+
+func TestFetchPublicKeys_SuccessClearsUnknownKIDCache(t *testing.T) {
+	withJWTRefreshSettings(t, time.Minute, 5*time.Minute, 1024)
+
+	key := generateTestKey(t)
+	srv := startJWKSServer(t, key)
+	v := newValidator(t, srv)
+
+	v.rememberUnknownKID("missing-before-fetch")
+	if entries := v.Stats().UnknownKIDCacheEntries; entries != 1 {
+		t.Fatalf("expected one negative cache entry, got %d", entries)
+	}
+	if err := v.fetchPublicKeys(); err != nil {
+		t.Fatalf("fetchPublicKeys: %v", err)
+	}
+	if entries := v.Stats().UnknownKIDCacheEntries; entries != 0 {
+		t.Errorf("successful fetch should clear the negative cache, got %d entries", entries)
+	}
+}
+
 func TestValidateToken_Tampered(t *testing.T) {
 	key := generateTestKey(t)
 	srv := startJWKSServer(t, key)
