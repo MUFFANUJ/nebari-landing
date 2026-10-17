@@ -223,6 +223,50 @@ have an `/auth` context root). `webapi.keycloak.url` is the in-cluster URL the w
 
 See [`charts/nebari-landing/values.yaml`](charts/nebari-landing/values.yaml) for the full set of configurable values.
 
+### Static services and the Keycloak card
+
+Cards normally come from `NebariApp` resources, and their visibility is derived from the app's `spec.auth`. A service
+that does its own auth, Keycloak being the obvious one, cannot get a group-gated card that way. For those, the webapi
+can serve static entries configured through the chart.
+
+To show the Keycloak admin console only to Keycloak admins:
+
+```yaml
+webapi:
+  keycloak:
+    landingPage:
+      enabled: true
+      requiredGroups: ["/nebari-admins"]
+```
+
+The card URL is built from `frontend.keycloak.url` and `frontend.keycloak.realm`, and the health probe from
+`webapi.keycloak.url` and the same realm (no probe when it is empty). `requiredGroups` must be a non-empty list.
+On NIC, the chart version NIC deploys must include this setting, and the group must exist in the realm. The default,
+`/nebari-admins`, is the platform admin group NIC plans for its admin tiles
+([nebari-infrastructure-core#435](https://github.com/nebari-dev/nebari-infrastructure-core/issues/435)); until NIC's
+realm setup creates it, create it in the realm yourself.
+
+Other services that do their own auth go in `webapi.staticServices`, a map keyed by id so that separate value files
+(for example NIC overlays) add entries instead of replacing each other's (see the example in `values.yaml`):
+
+```yaml
+webapi:
+  staticServices:
+    grafana-admin:
+      displayName: Grafana (admin)
+      url: https://grafana.example.com/admin
+      requiredGroups: ["/grafana-admins"]
+```
+
+A few things to keep in mind:
+
+- **Discovery only.** `visibility` and `requiredGroups` decide who sees the card. The target must still enforce its
+  own access, which Keycloak does for its admin console.
+- **Group values must match the token's `groups` claim exactly.** On NIC the realm's groups mapper emits full paths
+  such as `/nebari-admins`. The local dev realm (`dev/keycloak/`) sets `full.path=false` on the SPA client, so
+  there the claim holds bare names (`nebari-admins`). The group must already exist in the realm.
+- **No access requests.** Approving a request adds the user to the service's `requiredGroups`, so static entries
+  reject access requests with `403` rather than turning an approval into a privilege grant.
 
 
 ## Quick Start
@@ -328,6 +372,7 @@ npm run dev
   - `keycloak/` — Keycloak client.
   - `notifications/` — Notification store.
   - `pins/` — Pin store.
+  - `staticservices/` — Landing-page entries configured on the webapi instead of discovered from `NebariApp`s.
   - `watcher/` — NebariApp CR watcher.
   - `websocket/` — WebSocket hub.
   - `wsticket/` — Single-use WebSocket ticket store (Redis-backed).

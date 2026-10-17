@@ -1,6 +1,6 @@
 # Design Document: Nebari Landing Page
 
-**Status:** Draft **Author:** @viniciusdc **Created:** 2026-01-12 **Last Updated:** 2026-02-24
+**Status:** Draft **Author:** @viniciusdc **Created:** 2026-01-12 **Last Updated:** 2026-10-16
 
 ## Update Summary (2026-02-24)
 
@@ -11,7 +11,7 @@ This design has been updated to reflect the new authentication architecture:
 - **User-Initiated Sign-In:** "Sign In" button triggers OIDC flow (not automatic redirect)
 - **Group-Based Visibility:** Services use `visibility: private` with `requiredGroups` for access control
 - **Keycloak Integration:** Leverages upcoming `keycloakConfig` section in AuthConfig for declarative group management
-- **JWT Groups Claim:** Groups appear as flat list `["admin", "users"]` (not `["/admin"]`) for easy filtering
+- **JWT Groups Claim:** On NIC the SPA token carries full group paths (`["/admin", "/users"]`) from the realm's default `groups` scope; the local dev realm emits bare names (`["admin"]`). Group values in config must match the claim exactly
 
 **Key Architecture Changes:**
 - Landing page is a **public-facing** React SPA with optional authentication
@@ -68,7 +68,7 @@ Users need a single entry point to:
 2. **Real-time Updates**: Automatically update the landing page when services are added, modified, or removed
 3. **Health Visibility**: Display health status for services that expose health endpoints
 4. **Self-Service**: Services register themselves by including landing page metadata in their `NebariApp` CR
-5. **GitOps Compatible**: No manual registration required; everything is declarative via CRDs
+5. **GitOps Compatible**: No manual registration required; everything is declarative via CRDs (the one exception is the static entries described under [ConfigMap-Based Registration](#4-configmap-based-registration))
 
 
 
@@ -1252,13 +1252,13 @@ auth:
         protocol: "openid-connect"
         protocolMapper: "oidc-group-membership-mapper"
         config:
-          "full.path": "false"  # Groups as ["admin"] not ["/admin"]
+          "full.path": "false"  # this client only; the SPA token gets NIC's realm-default groups scope (full paths)
           "claim.name": "groups"
 ```
 
 **Landing Page Usage:**
 - Operator creates Keycloak groups for each service with `requiredGroups`
-- Groups appear in JWT as flat list: `["data-science", "users"]`
+- Groups appear in the JWT as full paths on NIC (`["/data-science", "/users"]`) and as bare names in the local dev realm
 - Backend filters services based on JWT groups claim
 - No additional Keycloak API calls needed at runtime
 
@@ -1384,6 +1384,8 @@ keycloakConfig:
 
 **Decision:** Rejected - extending NebariApp provides a unified configuration point
 
+**Update:** Partially adopted, for services that cannot get a group-gated card from `spec.auth`. Keycloak is the motivating case: it is the identity provider, so it cannot have `spec.auth` enabled, and an auth-disabled NebariApp always yields a public card. The NebariApp route was ruled out for it because enabling `spec.auth` without gateway enforcement still makes the operator provision an OIDC client (or require its secret), and a Keycloak NebariApp would create an HTTPRoute alongside the one NIC already ships. The webapi now accepts static entries from chart values (`webapi.staticServices`, plus the `webapi.keycloak.landingPage` toggle), implemented in `internal/staticservices`. Services that carry their own auth can use the same route; anything the operator can gate through `spec.auth` should still register through NebariApp.
+
 
 
 ## Security Considerations
@@ -1403,7 +1405,9 @@ Visibility and group access for the landing page are **automatically computed fr
 - **`auth.enabled = true, auth.groups = []`** → Service appears as "private" (any authenticated user can see it)
 - **`auth.enabled = true, auth.groups = [...]`** → Service appears as "private" with group restrictions (only users in specified groups can see it)
 
-This ensures landing page visibility exactly matches service access control, eliminating configuration redundancy.
+For NebariApps, this ensures landing page visibility exactly matches service access control, eliminating configuration redundancy.
+
+Static entries (see [ConfigMap-Based Registration](#4-configmap-based-registration)) are the exception: their `visibility` and `requiredGroups` are set in chart values and only decide who sees the card. The target service enforces its own access, and the landing page rejects access requests for them, because approving one would add the user to the entry's `requiredGroups`.
 
 **Group Validation Logic (in webapi):**
 ```go
@@ -1434,7 +1438,7 @@ func (h *Handler) canAccessService(service *cache.ServiceInfo, authenticated boo
 **Keycloak Integration:**
 - Operator provisions Keycloak client via `auth.keycloakConfig`
 - Groups are managed declaratively via `auth.keycloakConfig.groups`
-- JWT `/groups` claim contains user's group memberships (as `["admin", "users"]` not `["/admin"]`)
+- JWT `/groups` claim contains user's group memberships (full paths such as `["/admin"]` on NIC, bare names in the local dev realm)
 - Backend validates groups from JWT without additional Keycloak queries
 
 **API Server Permissions:**
@@ -1556,7 +1560,7 @@ curl http://localhost:8080/api/v1/services | jq '.services | length'
    - Platform-admin could post maintenance windows, new feature announcements
 
 4. **External Services**: Should we support registering services that don't have NebariApp CRs (e.g., external SaaS tools)?
-   - Could add `externalServices` ConfigMap for manual registration
+   - Resolved: static entries in chart values (`webapi.staticServices`), see [ConfigMap-Based Registration](#4-configmap-based-registration)
 
 5. **Group Hierarchy**: Should `requiredGroups` support OR vs AND logic?
    - Current: ANY group matches (OR logic)
